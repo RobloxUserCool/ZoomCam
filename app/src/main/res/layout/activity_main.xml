@@ -1,0 +1,110 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#000000">
+
+    <androidx.camera.view.PreviewView
+        android:id="@+id/previewView"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent" />
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:padding="12dp">
+
+        <Spinner
+            android:id="@+id/qualitySpinner"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content" />
+
+        <TextView
+            android:id="@+id/infoText"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:gravity="center"
+            android:textColor="#CCFFFFFF"
+            android:textSize="13sp" />
+
+        <Button
+            android:id="@+id/flipBtn"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="⟳" />
+    </LinearLayout>
+
+    <TextView
+        android:id="@+id/zoomLabel"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center_horizontal"
+        android:layout_marginTop="130dp"
+        android:shadowColor="#000000"
+        android:shadowRadius="8"
+        android:text="1.0x"
+        android:textColor="#FFCC00"
+        android:textSize="38sp"
+        android:textStyle="bold" />
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom"
+        android:background="#88000000"
+        android:orientation="vertical"
+        android:padding="16dp">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center"
+            android:orientation="horizontal">
+
+            <Button android:id="@+id/z1" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="1x" />
+            <Button android:id="@+id/z5" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="5x" />
+            <Button android:id="@+id/z10" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="10x" />
+            <Button android:id="@+id/zmax" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="MAX" />
+        </LinearLayout>
+
+        <SeekBar
+            android:id="@+id/zoomSeek"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:max="1000" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <TextView
+                android:id="@+id/timerText"
+                android:layout_width="80dp"
+                android:layout_height="wrap_content"
+                android:textColor="#FF4444"
+                android:textSize="18sp" />
+
+            <Button
+                android:id="@+id/recBtn"
+                android:layout_width="0dp"
+                android:layout_height="64dp"
+                android:layout_weight="1"
+                android:backgroundTint="#E22222"
+                android:text="ЗАПИСЬ"
+                android:textColor="#FFFFFF"
+                android:textSize="18sp" />
+
+            <View
+                android:layout_width="80dp"
+                android:layout_height="1dp" />
+        </LinearLayout>
+    </LinearLayout>
+</FrameLayout>
