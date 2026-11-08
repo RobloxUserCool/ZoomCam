@@ -27,6 +27,11 @@ import androidx.camera.camera2.interop.Camera2Interop
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.FocusMeteringAction
+import androidx.camera.core.ImageCapture
+import androidx.camera.core.ImageCaptureException
+import androidx.camera.core.resolutionselector.AspectRatioStrategy
+import androidx.camera.core.resolutionselector.ResolutionSelector
+import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.core.Preview
 import androidx.camera.core.ZoomState
 import androidx.camera.lifecycle.ProcessCameraProvider
@@ -67,6 +72,7 @@ class MainActivity : AppCompatActivity() {
     private var camera: Camera? = null
     private var videoCapture: VideoCapture<Recorder>? = null
     private var recording: Recording? = null
+    private var imageCapture: ImageCapture? = null
     private var zoomLive: LiveData<ZoomState>? = null
 
     private var lens = CameraSelector.LENS_FACING_BACK
@@ -174,6 +180,7 @@ class MainActivity : AppCompatActivity() {
             bindCamera()
         }
         recBtn.setOnClickListener { toggleRecord() }
+        findViewById<Button>(R.id.photoBtn).setOnClickListener { takePhoto() }
 
         // щипок = зум, тап = фокус
         val scale = ScaleGestureDetector(this, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
@@ -251,6 +258,14 @@ class MainActivity : AppCompatActivity() {
             .build()
         val previewBuilder = Preview.Builder()
         val vcBuilder = VideoCapture.Builder(recorder).setTargetFrameRate(Range(fps, fps))
+        val imageBuilder = ImageCapture.Builder()
+            .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
+            .setResolutionSelector(
+                ResolutionSelector.Builder()
+                    .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
+                    .setResolutionStrategy(ResolutionStrategy.HIGHEST_AVAILABLE_STRATEGY)
+                    .build()
+            )
 
         // Улучшения картинки на уровне камеры (только если телефон их поддерживает)
         try {
@@ -277,6 +292,14 @@ class MainActivity : AppCompatActivity() {
                         }
                     }
                 }
+                // для фото всегда максимальное шумоподавление и резкость
+                val imgExt = Camera2Interop.Extender(imageBuilder)
+                if (nr != null && nr.contains(CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY)) {
+                    imgExt.setCaptureRequestOption(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY)
+                }
+                if (edge != null && edge.contains(CaptureRequest.EDGE_MODE_HIGH_QUALITY)) {
+                    imgExt.setCaptureRequestOption(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_HIGH_QUALITY)
+                }
             }
         } catch (e: Exception) {
             // если что-то не поддерживается, просто снимаем с настройками по умолчанию
@@ -284,12 +307,14 @@ class MainActivity : AppCompatActivity() {
 
         val preview = previewBuilder.build().also { it.setSurfaceProvider(previewView.surfaceProvider) }
         val vc = vcBuilder.build()
+        val ic = imageBuilder.build()
         try {
             p.unbindAll()
             zoomLive?.removeObserver(zoomObs)
             minZ = 1f; maxZ = 1f; targetZ = 1f; curZ = 1f; lastApplied = 0f
-            camera = p.bindToLifecycle(this, selector, preview, vc)
+            camera = p.bindToLifecycle(this, selector, preview, vc, ic)
             videoCapture = vc
+            imageCapture = ic
             zoomLive = camera!!.cameraInfo.zoomState
             zoomLive!!.observe(this, zoomObs)
             zoomSeek.progress = 0
@@ -342,6 +367,30 @@ class MainActivity : AppCompatActivity() {
                 else -> {}
             }
         }
+    }
+
+    private fun takePhoto() {
+        val ic = imageCapture ?: return
+        val name = "ZoomCam_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        val values = ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+            put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
+            put(MediaStore.Images.Media.RELATIVE_PATH, "DCIM/Camera")
+        }
+        val out = ImageCapture.OutputFileOptions.Builder(
+            contentResolver, MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values
+        ).build()
+        previewView.animate().alpha(0.3f).setDuration(70).withEndAction {
+            previewView.animate().alpha(1f).setDuration(110).start()
+        }.start()
+        ic.takePicture(out, ContextCompat.getMainExecutor(this), object : ImageCapture.OnImageSavedCallback {
+            override fun onImageSaved(r: ImageCapture.OutputFileResults) {
+                Toast.makeText(this@MainActivity, "Фото сохранено в галерею", Toast.LENGTH_SHORT).show()
+            }
+            override fun onError(e: ImageCaptureException) {
+                Toast.makeText(this@MainActivity, "Ошибка фото: " + e.message, Toast.LENGTH_LONG).show()
+            }
+        })
     }
 
     private fun setRecUi(on: Boolean) {

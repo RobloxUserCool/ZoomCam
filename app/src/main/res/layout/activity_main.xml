@@ -107,9 +107,13 @@
                 android:textColor="#FFFFFF"
                 android:textSize="18sp" />
 
-            <View
+            <Button
+                android:id="@+id/photoBtn"
                 android:layout_width="80dp"
-                android:layout_height="1dp" />
+                android:layout_height="64dp"
+                android:layout_marginStart="8dp"
+                android:text="ФОТО"
+                android:textSize="14sp" />
         </LinearLayout>
     </LinearLayout>
 </FrameLayout>
