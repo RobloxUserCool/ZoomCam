@@ -9,7 +9,12 @@ import android.graphics.BitmapFactory
 import android.graphics.Matrix
 import android.media.ExifInterface
 import android.net.Uri
+import android.animation.ValueAnimator
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.view.animation.DecelerateInterpolator
+import android.view.animation.OvershootInterpolator
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CaptureRequest
 import android.provider.MediaStore
@@ -19,11 +24,9 @@ import android.view.GestureDetector
 import android.view.MotionEvent
 import android.view.ScaleGestureDetector
 import android.view.View
-import android.widget.AdapterView
-import android.widget.ArrayAdapter
+import android.widget.PopupMenu
 import android.widget.Button
 import android.widget.SeekBar
-import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
@@ -73,13 +76,19 @@ class MainActivity : AppCompatActivity() {
     private lateinit var infoText: TextView
     private lateinit var timerText: TextView
     private lateinit var zoomSeek: SeekBar
-    private lateinit var recBtn: Button
-    private lateinit var flipBtn: Button
-    private lateinit var qualitySpinner: Spinner
-    private lateinit var fpsSpinner: Spinner
-    private lateinit var nightBtn: Button
-    private lateinit var dayBtn: Button
-    private lateinit var aiBtn: Button
+    private lateinit var recBtn: View
+    private lateinit var flipBtn: TextView
+    private lateinit var qualityPill: TextView
+    private lateinit var fpsPill: TextView
+    private lateinit var focusRing: View
+    private lateinit var zoomChips: List<Pair<TextView, Float>>
+    private val ui = Handler(Looper.getMainLooper())
+    private val hideZoomLabel = Runnable { zoomLabel.animate().alpha(0f).setDuration(450).start() }
+    private var recPulse: ValueAnimator? = null
+    private val qualityShort = listOf("480p", "720p", "1080p", "4K")
+    private lateinit var nightBtn: TextView
+    private lateinit var dayBtn: TextView
+    private lateinit var aiBtn: TextView
 
     private var provider: ProcessCameraProvider? = null
     private var camera: Camera? = null
@@ -128,6 +137,9 @@ class MainActivity : AppCompatActivity() {
                     camera?.cameraControl?.setZoomRatio(curZ)
                     lastApplied = curZ
                     zoomLabel.text = fmt(curZ) + "x"
+                    if (zoomLabel.alpha < 1f) { zoomLabel.animate().cancel(); zoomLabel.alpha = 1f }
+                    ui.removeCallbacks(hideZoomLabel)
+                    ui.postDelayed(hideZoomLabel, 1300)
                     val hz = curZ >= 3f
                     if (hz != highZoom) { highZoom = hz; applyMode() }
                 }
@@ -147,8 +159,9 @@ class MainActivity : AppCompatActivity() {
         zoomSeek = findViewById(R.id.zoomSeek)
         recBtn = findViewById(R.id.recBtn)
         flipBtn = findViewById(R.id.flipBtn)
-        qualitySpinner = findViewById(R.id.qualitySpinner)
-        fpsSpinner = findViewById(R.id.fpsSpinner)
+        qualityPill = findViewById(R.id.qualityPill)
+        fpsPill = findViewById(R.id.fpsPill)
+        focusRing = findViewById(R.id.focusRing)
         nightBtn = findViewById(R.id.nightBtn)
         dayBtn = findViewById(R.id.dayBtn)
         aiBtn = findViewById(R.id.aiBtn)
@@ -156,31 +169,33 @@ class MainActivity : AppCompatActivity() {
         previewView.scaleType = PreviewView.ScaleType.FIT_CENTER
         previewView.keepScreenOn = true
 
-        val adapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, qualities.map { it.first })
-        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
-        qualitySpinner.adapter = adapter
-        qualitySpinner.setSelection(qualityIndex)
-        qualitySpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
-            override fun onItemSelected(p: AdapterView<*>?, v: View?, pos: Int, id: Long) {
-                if (pos != qualityIndex) {
-                    qualityIndex = pos
+        updatePills()
+        qualityPill.setOnClickListener { v ->
+            val pm = PopupMenu(this, v)
+            qualities.forEachIndexed { i, q -> pm.menu.add(0, i, i, q.first) }
+            pm.setOnMenuItemClickListener { mi ->
+                if (mi.itemId != qualityIndex) {
+                    qualityIndex = mi.itemId
+                    updatePills()
                     bindCamera()
                 }
+                true
             }
-            override fun onNothingSelected(p: AdapterView<*>?) {}
+            pm.show()
         }
-
-        val fpsAdapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, listOf("30 к/с", "60 к/с"))
-        fpsAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
-        fpsSpinner.adapter = fpsAdapter
-        fpsSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
-            override fun onItemSelected(p: AdapterView<*>?, v: View?, pos: Int, id: Long) {
-                if (pos != fpsIndex) {
-                    fpsIndex = pos
+        fpsPill.setOnClickListener { v ->
+            val pm = PopupMenu(this, v)
+            pm.menu.add(0, 0, 0, "30 к/с")
+            pm.menu.add(0, 1, 1, "60 к/с")
+            pm.setOnMenuItemClickListener { mi ->
+                if (mi.itemId != fpsIndex) {
+                    fpsIndex = mi.itemId
+                    updatePills()
                     bindCamera()
                 }
+                true
             }
-            override fun onNothingSelected(p: AdapterView<*>?) {}
+            pm.show()
         }
 
         zoomSeek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
@@ -191,10 +206,16 @@ class MainActivity : AppCompatActivity() {
             override fun onStopTrackingTouch(s: SeekBar?) {}
         })
 
-        findViewById<Button>(R.id.z1).setOnClickListener { setTarget(1f) }
-        findViewById<Button>(R.id.z5).setOnClickListener { setTarget(5f) }
-        findViewById<Button>(R.id.z10).setOnClickListener { setTarget(10f) }
-        findViewById<Button>(R.id.zmax).setOnClickListener { setTarget(maxZ) }
+        zoomChips = listOf(
+            findViewById<TextView>(R.id.z1) to 1f,
+            findViewById<TextView>(R.id.z5) to 5f,
+            findViewById<TextView>(R.id.z10) to 10f,
+            findViewById<TextView>(R.id.zmax) to -1f
+        )
+        for ((chip, z) in zoomChips) {
+            chip.setOnClickListener { setTarget(if (z < 0f) maxZ else z) }
+            pressFx(chip)
+        }
 
         flipBtn.setOnClickListener {
             lens = if (lens == CameraSelector.LENS_FACING_BACK)
@@ -211,7 +232,23 @@ class MainActivity : AppCompatActivity() {
         updateModeUi()
 
         recBtn.setOnClickListener { toggleRecord() }
-        findViewById<Button>(R.id.photoBtn).setOnClickListener { takePhoto() }
+        val photoBtn = findViewById<View>(R.id.photoBtn)
+        photoBtn.setOnClickListener { takePhoto() }
+        for (v in listOf(photoBtn, recBtn, flipBtn, nightBtn, dayBtn, aiBtn, qualityPill, fpsPill)) pressFx(v)
+
+        // красивое появление панелей
+        val topBar = findViewById<View>(R.id.topBar)
+        val bottomBar = findViewById<View>(R.id.bottomBar)
+        val sideBar = findViewById<View>(R.id.sideBar)
+        topBar.alpha = 0f; topBar.translationY = -160f
+        bottomBar.alpha = 0f; bottomBar.translationY = 320f
+        sideBar.alpha = 0f; sideBar.translationX = 160f
+        val ip = DecelerateInterpolator(1.6f)
+        topBar.animate().alpha(1f).translationY(0f).setDuration(500).setInterpolator(ip).start()
+        bottomBar.animate().alpha(1f).translationY(0f).setDuration(550).setInterpolator(ip).start()
+        sideBar.animate().alpha(1f).translationX(0f).setStartDelay(200).setDuration(500).setInterpolator(ip).start()
+        ui.postDelayed(hideZoomLabel, 1800)
+        updateZoomChips()
 
         // щипок = зум, тап = фокус
         val scale = ScaleGestureDetector(this, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
@@ -224,6 +261,7 @@ class MainActivity : AppCompatActivity() {
             override fun onSingleTapUp(e: MotionEvent): Boolean {
                 val pt = previewView.meteringPointFactory.createPoint(e.x, e.y)
                 camera?.cameraControl?.startFocusAndMetering(FocusMeteringAction.Builder(pt).build())
+                showFocusRing(e.x, e.y)
                 return true
             }
         })
@@ -349,11 +387,12 @@ class MainActivity : AppCompatActivity() {
             zoomLive = camera!!.cameraInfo.zoomState
             zoomLive!!.observe(this, zoomObs)
             zoomSeek.progress = 0
+            updateZoomChips()
             applyMode()
         } catch (e: Exception) {
             if (fpsIndex == 1) {
                 fpsIndex = 0
-                fpsSpinner.setSelection(0)
+                updatePills()
                 Toast.makeText(this, "Такой режим в 60 к/с не поддерживается, включил 30", Toast.LENGTH_LONG).show()
                 bindCamera()
             } else {
@@ -589,16 +628,63 @@ class MainActivity : AppCompatActivity() {
         Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
     }
 
+    private fun setSel(v: View, on: Boolean) {
+        v.isSelected = on
+        val sc = if (on) 1.12f else 1f
+        v.tag = sc
+        v.animate().scaleX(sc).scaleY(sc).alpha(if (on) 1f else 0.85f)
+            .setDuration(220).setInterpolator(OvershootInterpolator(2f)).start()
+    }
+
     private fun updateModeUi() {
-        nightBtn.alpha = if (mode == 1) 1f else 0.55f
-        dayBtn.alpha = if (mode == 2) 1f else 0.55f
-        aiBtn.alpha = if (aiOn) 1f else 0.55f
-        aiBtn.backgroundTintList = android.content.res.ColorStateList.valueOf(
-            if (aiOn) 0xFF2E7D32.toInt() else 0xFF444444.toInt())
-        nightBtn.backgroundTintList = android.content.res.ColorStateList.valueOf(
-            if (mode == 1) 0xFF3F51B5.toInt() else 0xFF444444.toInt())
-        dayBtn.backgroundTintList = android.content.res.ColorStateList.valueOf(
-            if (mode == 2) 0xFFFF9800.toInt() else 0xFF444444.toInt())
+        setSel(nightBtn, mode == 1)
+        setSel(dayBtn, mode == 2)
+        setSel(aiBtn, aiOn)
+    }
+
+    private fun updatePills() {
+        qualityPill.text = qualityShort[qualityIndex] + " ▾"
+        fpsPill.text = (if (fpsIndex == 1) "60" else "30") + " к/с ▾"
+    }
+
+    private fun updateZoomChips() {
+        for ((v, z) in zoomChips) {
+            val ref = if (z < 0f) maxZ else z
+            val on = ref > 0f && abs(targetZ - ref) < 0.04f * ref
+            if (v.isSelected != on) v.isSelected = on
+        }
+    }
+
+    // лёгкая «пружинка» при нажатии, без нагрузки на процессор
+    @SuppressLint("ClickableViewAccessibility")
+    private fun pressFx(v: View) {
+        v.setOnTouchListener { view, e ->
+            val base = (view.tag as? Float) ?: 1f
+            when (e.actionMasked) {
+                MotionEvent.ACTION_DOWN ->
+                    view.animate().scaleX(base * 0.88f).scaleY(base * 0.88f).setDuration(90)
+                        .setInterpolator(DecelerateInterpolator()).start()
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL ->
+                    view.animate().scaleX(base).scaleY(base).setDuration(260)
+                        .setInterpolator(OvershootInterpolator(3f)).start()
+            }
+            false
+        }
+    }
+
+    private fun showFocusRing(x: Float, y: Float) {
+        val half = focusRing.width / 2f
+        focusRing.animate().cancel()
+        focusRing.translationX = x - half
+        focusRing.translationY = y - half
+        focusRing.alpha = 1f
+        focusRing.scaleX = 1.6f
+        focusRing.scaleY = 1.6f
+        focusRing.animate().scaleX(1f).scaleY(1f).setStartDelay(0).setDuration(240)
+            .setInterpolator(DecelerateInterpolator())
+            .withEndAction {
+                focusRing.animate().alpha(0f).setStartDelay(550).setDuration(300).start()
+            }.start()
     }
 
     // Ночной/дневной режим работает сразу для превью, видео и фото (без перезапуска камеры)
@@ -646,16 +732,31 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setRecUi(on: Boolean) {
-        recBtn.text = if (on) "СТОП" else "ЗАПИСЬ"
-        qualitySpinner.isEnabled = !on
-        fpsSpinner.isEnabled = !on
-        flipBtn.isEnabled = !on
-        if (!on) timerText.text = ""
+        recBtn.isSelected = on
+        for (v in listOf<View>(qualityPill, fpsPill, flipBtn)) {
+            v.isEnabled = !on
+            v.animate().alpha(if (on) 0.35f else 1f).setDuration(200).start()
+        }
+        recPulse?.cancel()
+        if (on) {
+            recPulse = ValueAnimator.ofFloat(1f, 0.35f).apply {
+                duration = 650
+                repeatCount = ValueAnimator.INFINITE
+                repeatMode = ValueAnimator.REVERSE
+                addUpdateListener { timerText.alpha = it.animatedValue as Float }
+                start()
+            }
+        } else {
+            recPulse = null
+            timerText.alpha = 1f
+            timerText.text = ""
+        }
     }
 
     private fun setTarget(z: Float, updateSeek: Boolean = true) {
         targetZ = z.coerceIn(minZ, maxZ)
         if (updateSeek) zoomSeek.progress = zoomToSeek(targetZ)
+        updateZoomChips()
     }
 
     private fun seekToZoom(p: Int): Float =

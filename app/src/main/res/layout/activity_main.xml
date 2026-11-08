@@ -9,23 +9,56 @@
         android:layout_width="match_parent"
         android:layout_height="match_parent" />
 
+    <View
+        android:id="@+id/focusRing"
+        android:layout_width="76dp"
+        android:layout_height="76dp"
+        android:layout_gravity="top|start"
+        android:alpha="0"
+        android:background="@drawable/bg_focus_ring" />
+
+    <!-- верхняя панель -->
     <LinearLayout
+        android:id="@+id/topBar"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_gravity="top"
+        android:background="@drawable/bg_top_gradient"
         android:gravity="center_vertical"
         android:orientation="horizontal"
-        android:padding="12dp">
+        android:paddingStart="12dp"
+        android:paddingTop="14dp"
+        android:paddingEnd="12dp"
+        android:paddingBottom="26dp">
 
-        <Spinner
-            android:id="@+id/qualitySpinner"
+        <TextView
+            android:id="@+id/qualityPill"
             android:layout_width="wrap_content"
-            android:layout_height="wrap_content" />
+            android:layout_height="40dp"
+            android:background="@drawable/bg_pill"
+            android:clickable="true"
+            android:gravity="center"
+            android:paddingStart="16dp"
+            android:paddingEnd="16dp"
+            android:text="1080p ▾"
+            android:textColor="#FFFFFF"
+            android:textSize="14sp"
+            android:textStyle="bold" />
 
-        <Spinner
-            android:id="@+id/fpsSpinner"
+        <TextView
+            android:id="@+id/fpsPill"
             android:layout_width="wrap_content"
-            android:layout_height="wrap_content" />
+            android:layout_height="40dp"
+            android:layout_marginStart="8dp"
+            android:background="@drawable/bg_pill"
+            android:clickable="true"
+            android:gravity="center"
+            android:paddingStart="16dp"
+            android:paddingEnd="16dp"
+            android:text="30 к/с ▾"
+            android:textColor="#FFFFFF"
+            android:textSize="14sp"
+            android:textStyle="bold" />
 
         <TextView
             android:id="@+id/infoText"
@@ -33,53 +66,60 @@
             android:layout_height="wrap_content"
             android:layout_weight="1"
             android:gravity="center"
-            android:textColor="#CCFFFFFF"
-            android:textSize="13sp" />
+            android:shadowColor="#000000"
+            android:shadowRadius="4"
+            android:textColor="#E6FFFFFF"
+            android:textSize="12sp" />
 
-        <Button
+        <TextView
             android:id="@+id/flipBtn"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="⟳" />
+            android:layout_width="44dp"
+            android:layout_height="44dp"
+            android:background="@drawable/bg_round"
+            android:clickable="true"
+            android:gravity="center"
+            android:text="⟳"
+            android:textColor="#FFFFFF"
+            android:textSize="22sp" />
     </LinearLayout>
 
+    <!-- боковая колонка режимов -->
     <LinearLayout
+        android:id="@+id/sideBar"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:layout_gravity="top|end"
-        android:layout_marginTop="68dp"
+        android:layout_gravity="end|center_vertical"
         android:layout_marginEnd="12dp"
-        android:orientation="horizontal">
+        android:orientation="vertical">
 
-        <Button
+        <TextView
             android:id="@+id/nightBtn"
-            android:layout_width="52dp"
-            android:layout_height="52dp"
-            android:minWidth="0dp"
-            android:minHeight="0dp"
-            android:padding="0dp"
+            android:layout_width="50dp"
+            android:layout_height="50dp"
+            android:layout_marginTop="0dp"
+            android:background="@drawable/bg_moon"
+            android:clickable="true"
+            android:gravity="center"
             android:text="🌙"
             android:textSize="22sp" />
-
-        <Button
+        <TextView
             android:id="@+id/dayBtn"
-            android:layout_width="52dp"
-            android:layout_height="52dp"
-            android:layout_marginStart="8dp"
-            android:minWidth="0dp"
-            android:minHeight="0dp"
-            android:padding="0dp"
+            android:layout_width="50dp"
+            android:layout_height="50dp"
+            android:layout_marginTop="12dp"
+            android:background="@drawable/bg_sun"
+            android:clickable="true"
+            android:gravity="center"
             android:text="☀️"
             android:textSize="22sp" />
-
-        <Button
+        <TextView
             android:id="@+id/aiBtn"
-            android:layout_width="52dp"
-            android:layout_height="52dp"
-            android:layout_marginStart="8dp"
-            android:minWidth="0dp"
-            android:minHeight="0dp"
-            android:padding="0dp"
+            android:layout_width="50dp"
+            android:layout_height="50dp"
+            android:layout_marginTop="12dp"
+            android:background="@drawable/bg_ai"
+            android:clickable="true"
+            android:gravity="center"
             android:text="✨"
             android:textSize="22sp" />
     </LinearLayout>
@@ -88,22 +128,26 @@
         android:id="@+id/zoomLabel"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:layout_gravity="center_horizontal"
-        android:layout_marginTop="130dp"
-        android:shadowColor="#000000"
-        android:shadowRadius="8"
+        android:layout_gravity="center"
+        android:shadowColor="#CC000000"
+        android:shadowRadius="12"
         android:text="1.0x"
         android:textColor="#FFCC00"
-        android:textSize="38sp"
+        android:textSize="46sp"
         android:textStyle="bold" />
 
+    <!-- нижняя панель -->
     <LinearLayout
+        android:id="@+id/bottomBar"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_gravity="bottom"
-        android:background="#88000000"
+        android:background="@drawable/bg_bottom_gradient"
         android:orientation="vertical"
-        android:padding="16dp">
+        android:paddingStart="16dp"
+        android:paddingTop="28dp"
+        android:paddingEnd="16dp"
+        android:paddingBottom="18dp">
 
         <LinearLayout
             android:layout_width="match_parent"
@@ -111,18 +155,69 @@
             android:gravity="center"
             android:orientation="horizontal">
 
-            <Button android:id="@+id/z1" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="1x" />
-            <Button android:id="@+id/z5" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="5x" />
-            <Button android:id="@+id/z10" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="10x" />
-            <Button android:id="@+id/zmax" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="MAX" />
+            <TextView
+                android:id="@+id/z1"
+                android:layout_width="64dp"
+                android:layout_height="38dp"
+                android:layout_marginStart="5dp"
+                android:layout_marginEnd="5dp"
+                android:background="@drawable/bg_chip"
+                android:clickable="true"
+                android:gravity="center"
+                android:text="1x"
+                android:textColor="@color/chip_text"
+                android:textSize="15sp"
+                android:textStyle="bold" />
+            <TextView
+                android:id="@+id/z5"
+                android:layout_width="64dp"
+                android:layout_height="38dp"
+                android:layout_marginStart="5dp"
+                android:layout_marginEnd="5dp"
+                android:background="@drawable/bg_chip"
+                android:clickable="true"
+                android:gravity="center"
+                android:text="5x"
+                android:textColor="@color/chip_text"
+                android:textSize="15sp"
+                android:textStyle="bold" />
+            <TextView
+                android:id="@+id/z10"
+                android:layout_width="64dp"
+                android:layout_height="38dp"
+                android:layout_marginStart="5dp"
+                android:layout_marginEnd="5dp"
+                android:background="@drawable/bg_chip"
+                android:clickable="true"
+                android:gravity="center"
+                android:text="10x"
+                android:textColor="@color/chip_text"
+                android:textSize="15sp"
+                android:textStyle="bold" />
+            <TextView
+                android:id="@+id/zmax"
+                android:layout_width="64dp"
+                android:layout_height="38dp"
+                android:layout_marginStart="5dp"
+                android:layout_marginEnd="5dp"
+                android:background="@drawable/bg_chip"
+                android:clickable="true"
+                android:gravity="center"
+                android:text="MAX"
+                android:textColor="@color/chip_text"
+                android:textSize="15sp"
+                android:textStyle="bold" />
         </LinearLayout>
 
         <SeekBar
             android:id="@+id/zoomSeek"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="8dp"
-            android:max="1000" />
+            android:layout_marginTop="6dp"
+            android:max="1000"
+            android:progressBackgroundTint="#55FFFFFF"
+            android:progressTint="#FFCC00"
+            android:thumbTint="#FFCC00" />
 
         <LinearLayout
             android:layout_width="match_parent"
@@ -133,28 +228,34 @@
 
             <TextView
                 android:id="@+id/timerText"
-                android:layout_width="80dp"
-                android:layout_height="wrap_content"
-                android:textColor="#FF4444"
-                android:textSize="18sp" />
-
-            <Button
-                android:id="@+id/recBtn"
                 android:layout_width="0dp"
-                android:layout_height="64dp"
+                android:layout_height="wrap_content"
                 android:layout_weight="1"
-                android:backgroundTint="#E22222"
-                android:text="ЗАПИСЬ"
-                android:textColor="#FFFFFF"
-                android:textSize="18sp" />
+                android:shadowColor="#000000"
+                android:shadowRadius="4"
+                android:textColor="#FF5555"
+                android:textSize="18sp"
+                android:textStyle="bold" />
 
-            <Button
+            <View
                 android:id="@+id/photoBtn"
-                android:layout_width="80dp"
-                android:layout_height="64dp"
-                android:layout_marginStart="8dp"
-                android:text="ФОТО"
-                android:textSize="14sp" />
+                android:layout_width="68dp"
+                android:layout_height="68dp"
+                android:background="@drawable/bg_shutter"
+                android:clickable="true" />
+
+            <View
+                android:id="@+id/recBtn"
+                android:layout_width="68dp"
+                android:layout_height="68dp"
+                android:layout_marginStart="28dp"
+                android:background="@drawable/bg_rec"
+                android:clickable="true" />
+
+            <View
+                android:layout_width="0dp"
+                android:layout_height="1dp"
+                android:layout_weight="1" />
         </LinearLayout>
     </LinearLayout>
 </FrameLayout>
