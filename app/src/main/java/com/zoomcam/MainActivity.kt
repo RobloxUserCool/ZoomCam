@@ -317,7 +317,7 @@ class MainActivity : AppCompatActivity() {
         val values = ContentValues().apply {
             put(MediaStore.MediaColumns.DISPLAY_NAME, name)
             put(MediaStore.MediaColumns.MIME_TYPE, "video/mp4")
-            put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/ZoomCam")
+            put(MediaStore.Video.Media.RELATIVE_PATH, "DCIM/Camera")
         }
         val out = MediaStoreOutputOptions.Builder(contentResolver, MediaStore.Video.Media.EXTERNAL_CONTENT_URI)
             .setContentValues(values).build()
@@ -336,7 +336,7 @@ class MainActivity : AppCompatActivity() {
                     if (ev.hasError()) {
                         Toast.makeText(this, "Ошибка записи: " + ev.error, Toast.LENGTH_LONG).show()
                     } else {
-                        Toast.makeText(this, "Сохранено: Movies/ZoomCam", Toast.LENGTH_LONG).show()
+                        Toast.makeText(this, "Сохранено: DCIM/Camera", Toast.LENGTH_LONG).show()
                     }
                 }
                 else -> {}
