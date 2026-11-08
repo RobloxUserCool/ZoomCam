@@ -24,7 +24,13 @@ import android.view.GestureDetector
 import android.view.MotionEvent
 import android.view.ScaleGestureDetector
 import android.view.View
+import android.widget.ImageView
 import android.widget.PopupMenu
+import android.widget.ProgressBar
+import android.view.ViewGroup
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
+import androidx.appcompat.widget.SwitchCompat
 import android.widget.Button
 import android.widget.SeekBar
 import android.widget.TextView
@@ -85,6 +91,14 @@ class MainActivity : AppCompatActivity() {
     private val ui = Handler(Looper.getMainLooper())
     private val hideZoomLabel = Runnable { zoomLabel.animate().alpha(0f).setDuration(450).start() }
     private var recPulse: ValueAnimator? = null
+    private var dlg: AlertDialog? = null
+    private var dlgProgress: ProgressBar? = null
+    private var dlgStatus: TextView? = null
+    private var dlgPreview: ImageView? = null
+    private var dlgPick: TextView? = null
+    private val pickPhoto = registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        if (uri != null) enhancePicked(uri)
+    }
     private val qualityShort = listOf("480p", "720p", "1080p", "4K")
     private lateinit var nightBtn: TextView
     private lateinit var dayBtn: TextView
@@ -224,11 +238,7 @@ class MainActivity : AppCompatActivity() {
         }
         nightBtn.setOnClickListener { setMode(if (mode == 1) 0 else 1) }
         dayBtn.setOnClickListener { setMode(if (mode == 2) 0 else 2) }
-        aiBtn.setOnClickListener {
-            aiOn = !aiOn
-            updateModeUi()
-            Toast.makeText(this, if (aiOn) "ИИ-улучшение фото: вкл" else "ИИ-улучшение фото: выкл", Toast.LENGTH_SHORT).show()
-        }
+        aiBtn.setOnClickListener { showEnhanceDialog() }
         updateModeUi()
 
         recBtn.setOnClickListener { toggleRecord() }
@@ -616,6 +626,128 @@ class MainActivity : AppCompatActivity() {
         contentResolver.openOutputStream(uri)?.use { bmp.compress(Bitmap.CompressFormat.JPEG, 95, it) }
     }
 
+    // ---------- окно «Улучшение качества» ----------
+    private fun showEnhanceDialog() {
+        val v = layoutInflater.inflate(R.layout.dialog_enhance, null)
+        dlgProgress = v.findViewById(R.id.enProgress)
+        dlgStatus = v.findViewById(R.id.enStatus)
+        dlgPreview = v.findViewById(R.id.enPreview)
+        dlgPick = v.findViewById(R.id.enPick)
+        val sw = v.findViewById<SwitchCompat>(R.id.enAuto)
+        sw.isChecked = aiOn
+        sw.setOnCheckedChangeListener { _, on ->
+            aiOn = on
+            updateModeUi()
+            applyMode()
+        }
+        dlgPick?.setOnClickListener {
+            if (aiBusy) Toast.makeText(this, "Подожди, ИИ ещё обрабатывает прошлое фото", Toast.LENGTH_SHORT).show()
+            else pickPhoto.launch("image/*")
+        }
+        val close = v.findViewById<View>(R.id.enClose)
+        close.setOnClickListener { dlg?.dismiss() }
+        pressFx(close)
+        dlgPick?.let { pressFx(it) }
+        val d = AlertDialog.Builder(this).setView(v).create()
+        d.window?.setBackgroundDrawableResource(R.drawable.bg_dialog)
+        d.setOnDismissListener {
+            dlgProgress = null; dlgStatus = null; dlgPreview = null; dlgPick = null; dlg = null
+        }
+        dlg = d
+        d.show()
+        d.window?.setLayout((resources.displayMetrics.widthPixels * 0.9f).toInt(), ViewGroup.LayoutParams.WRAP_CONTENT)
+        v.scaleX = 0.92f; v.scaleY = 0.92f; v.alpha = 0f
+        v.animate().scaleX(1f).scaleY(1f).alpha(1f).setDuration(260)
+            .setInterpolator(OvershootInterpolator(1.4f)).start()
+        if (aiBusy) setEnhanceUi("ИИ ещё работает…", null, null)
+    }
+
+    private fun setEnhanceUi(status: String, progress: Int?, preview: Bitmap? = null) {
+        dlgStatus?.let { it.text = status; it.visibility = View.VISIBLE }
+        dlgProgress?.let {
+            if (progress != null) { it.progress = progress; it.visibility = View.VISIBLE }
+            else it.visibility = View.GONE
+        }
+        if (preview != null) dlgPreview?.let { it.setImageBitmap(preview); it.visibility = View.VISIBLE }
+    }
+
+    private fun enhancePicked(uri: Uri) {
+        if (aiBusy) return
+        aiBusy = true
+        dlgPick?.alpha = 0.4f
+        dlgPreview?.visibility = View.GONE
+        setEnhanceUi("Открываю фото…", 0)
+        Thread {
+            var msg: String
+            var prev: Bitmap? = null
+            try {
+                val src = loadForEnhance(uri, 800)
+                if (src == null) {
+                    msg = "Не удалось открыть это фото"
+                } else {
+                    val big = superRes(src) { pr ->
+                        runOnUiThread {
+                            setEnhanceUi("ИИ улучшает… " + pr + "%", pr)
+                            infoText.text = "ИИ " + pr + "%"
+                        }
+                    }
+                    if (big == null) {
+                        msg = "Нет модели esrgan.tflite в приложении"
+                    } else {
+                        saveJpeg(big, "ZoomCam_AI_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()))
+                        val ph = (600f * big.height / big.width).toInt().coerceAtLeast(1)
+                        prev = Bitmap.createScaledBitmap(big, 600, ph, true)
+                        msg = "Готово! " + big.width + "x" + big.height + ", фото сохранено в галерею"
+                    }
+                }
+            } catch (e: Throwable) {
+                msg = "Не получилось: " + e.message
+            }
+            runOnUiThread {
+                aiBusy = false
+                dlgPick?.alpha = 1f
+                infoText.text = "зум до " + fmt(maxZ) + "x"
+                setEnhanceUi(msg, null, prev)
+                Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+            }
+        }.start()
+    }
+
+    // для выбранного из галереи фото: уменьшаем до maxSide по длинной стороне (убирает «квадраты») и поворачиваем как надо
+    private fun loadForEnhance(uri: Uri, maxSide: Int): Bitmap? {
+        val bo = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bo) }
+        if (bo.outWidth <= 0 || bo.outHeight <= 0) return null
+        var sample = 1
+        while (maxOf(bo.outWidth, bo.outHeight) / (sample * 2) >= maxSide) sample *= 2
+        val o = BitmapFactory.Options().apply { inSampleSize = sample }
+        var bmp = contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, o) } ?: return null
+        val orient = try {
+            contentResolver.openInputStream(uri)?.use {
+                ExifInterface(it).getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)
+            } ?: ExifInterface.ORIENTATION_NORMAL
+        } catch (e: Exception) {
+            ExifInterface.ORIENTATION_NORMAL
+        }
+        val deg = when (orient) {
+            ExifInterface.ORIENTATION_ROTATE_90 -> 90f
+            ExifInterface.ORIENTATION_ROTATE_180 -> 180f
+            ExifInterface.ORIENTATION_ROTATE_270 -> 270f
+            else -> 0f
+        }
+        if (deg != 0f) {
+            val m = Matrix().apply { postRotate(deg) }
+            bmp = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, m, true)
+        }
+        val ms = maxOf(bmp.width, bmp.height)
+        if (ms > maxSide) {
+            val f = maxSide.toFloat() / ms
+            bmp = Bitmap.createScaledBitmap(
+                bmp, (bmp.width * f).toInt().coerceAtLeast(16), (bmp.height * f).toInt().coerceAtLeast(16), true)
+        }
+        return bmp
+    }
+
     private fun setMode(m: Int) {
         mode = m
         updateModeUi()
@@ -705,11 +837,11 @@ class MainActivity : AppCompatActivity() {
             val edgeModes = c2info.getCameraCharacteristic(CameraCharacteristics.EDGE_AVAILABLE_EDGE_MODES)
             val b = CaptureRequestOptions.Builder()
             // сглаживание при сильном зуме: сильное шумоподавление и без излишней резкости (она подчёркивает «квадраты»)
-            if (highZoom && fpsIndex == 0) {
+            if (aiOn && fpsIndex == 0) {
                 if (nrModes != null && nrModes.contains(CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY)) {
                     b.setCaptureRequestOption(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY)
                 }
-                if (edgeModes != null && edgeModes.contains(CaptureRequest.EDGE_MODE_FAST)) {
+                if (highZoom && edgeModes != null && edgeModes.contains(CaptureRequest.EDGE_MODE_FAST)) {
                     b.setCaptureRequestOption(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_FAST)
                 }
             }

@@ -1,0 +1,98 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="vertical"
+    android:padding="22dp">
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="✨ Улучшение качества"
+        android:textColor="#FFFFFF"
+        android:textSize="20sp"
+        android:textStyle="bold" />
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="6dp"
+        android:text="Выбери фото из галереи: ИИ уберёт пиксели и вернёт резкость. Работает без интернета."
+        android:textColor="#B3FFFFFF"
+        android:textSize="13sp" />
+
+    <TextView
+        android:id="@+id/enPick"
+        android:layout_width="match_parent"
+        android:layout_height="52dp"
+        android:layout_marginTop="16dp"
+        android:background="@drawable/bg_primary"
+        android:clickable="true"
+        android:gravity="center"
+        android:text="Выбрать фото"
+        android:textColor="#000000"
+        android:textSize="16sp"
+        android:textStyle="bold" />
+
+    <ImageView
+        android:id="@+id/enPreview"
+        android:layout_width="match_parent"
+        android:layout_height="170dp"
+        android:layout_marginTop="14dp"
+        android:scaleType="fitCenter"
+        android:visibility="gone" />
+
+    <ProgressBar
+        android:id="@+id/enProgress"
+        style="?android:attr/progressBarStyleHorizontal"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="14dp"
+        android:max="100"
+        android:progressTint="#FFCC00"
+        android:visibility="gone" />
+
+    <TextView
+        android:id="@+id/enStatus"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:textColor="#FFFFFF"
+        android:textSize="13sp"
+        android:visibility="gone" />
+
+    <View
+        android:layout_width="match_parent"
+        android:layout_height="1dp"
+        android:layout_marginTop="18dp"
+        android:background="#22FFFFFF" />
+
+    <androidx.appcompat.widget.SwitchCompat
+        android:id="@+id/enAuto"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="12dp"
+        android:text="Улучшать при съёмке"
+        android:textColor="#FFFFFF"
+        android:textSize="15sp" />
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="4dp"
+        android:text="Фото снимается с ИИ, видео сглаживается. Готовые видео ИИ улучшить не может: этому телефону это не по силам."
+        android:textColor="#80FFFFFF"
+        android:textSize="12sp" />
+
+    <TextView
+        android:id="@+id/enClose"
+        android:layout_width="match_parent"
+        android:layout_height="44dp"
+        android:layout_marginTop="12dp"
+        android:background="@drawable/bg_pill"
+        android:clickable="true"
+        android:gravity="center"
+        android:text="Закрыть"
+        android:textColor="#FFFFFF"
+        android:textSize="14sp" />
+</LinearLayout>
