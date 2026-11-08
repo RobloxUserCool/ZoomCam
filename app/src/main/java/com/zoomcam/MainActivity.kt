@@ -5,7 +5,10 @@ import android.annotation.SuppressLint
 import android.content.ContentValues
 import android.content.pm.PackageManager
 import android.os.Bundle
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CaptureRequest
 import android.provider.MediaStore
+import android.util.Range
 import android.view.Choreographer
 import android.view.GestureDetector
 import android.view.MotionEvent
@@ -19,6 +22,8 @@ import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
+import androidx.camera.camera2.interop.Camera2CameraInfo
+import androidx.camera.camera2.interop.Camera2Interop
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.FocusMeteringAction
@@ -56,6 +61,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var recBtn: Button
     private lateinit var flipBtn: Button
     private lateinit var qualitySpinner: Spinner
+    private lateinit var fpsSpinner: Spinner
 
     private var provider: ProcessCameraProvider? = null
     private var camera: Camera? = null
@@ -77,6 +83,9 @@ class MainActivity : AppCompatActivity() {
         "4K" to Quality.UHD
     )
     private var qualityIndex = 2
+    private var fpsIndex = 0   // 0 = 30 к/с, 1 = 60 к/с
+    // целевой битрейт: заметно выше стандартного, чтобы сохранялись детали и не было «каши» в движении
+    private val bitrates = listOf(8_000_000, 16_000_000, 30_000_000, 90_000_000)
 
     private val zoomObs = Observer<ZoomState> { z ->
         minZ = z.minZoomRatio
@@ -114,6 +123,7 @@ class MainActivity : AppCompatActivity() {
         recBtn = findViewById(R.id.recBtn)
         flipBtn = findViewById(R.id.flipBtn)
         qualitySpinner = findViewById(R.id.qualitySpinner)
+        fpsSpinner = findViewById(R.id.fpsSpinner)
 
         previewView.scaleType = PreviewView.ScaleType.FIT_CENTER
         previewView.keepScreenOn = true
@@ -126,6 +136,19 @@ class MainActivity : AppCompatActivity() {
             override fun onItemSelected(p: AdapterView<*>?, v: View?, pos: Int, id: Long) {
                 if (pos != qualityIndex) {
                     qualityIndex = pos
+                    bindCamera()
+                }
+            }
+            override fun onNothingSelected(p: AdapterView<*>?) {}
+        }
+
+        val fpsAdapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, listOf("30 к/с", "60 к/с"))
+        fpsAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        fpsSpinner.adapter = fpsAdapter
+        fpsSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(p: AdapterView<*>?, v: View?, pos: Int, id: Long) {
+                if (pos != fpsIndex) {
+                    fpsIndex = pos
                     bindCamera()
                 }
             }
@@ -217,13 +240,50 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, "Сначала останови запись", Toast.LENGTH_SHORT).show()
             return
         }
-        val preview = Preview.Builder().build().also { it.setSurfaceProvider(previewView.surfaceProvider) }
+        val selector = CameraSelector.Builder().requireLensFacing(lens).build()
+        val fps = if (fpsIndex == 1) 60 else 30
         val q = qualities[qualityIndex].second
+        val bitrate = (bitrates[qualityIndex] * (if (fps > 30) 1.5 else 1.0)).toInt()
+
         val recorder = Recorder.Builder()
             .setQualitySelector(QualitySelector.from(q, FallbackStrategy.lowerQualityOrHigherThan(q)))
+            .setTargetVideoEncodingBitRate(bitrate)
             .build()
-        val vc = VideoCapture.withOutput(recorder)
-        val selector = CameraSelector.Builder().requireLensFacing(lens).build()
+        val previewBuilder = Preview.Builder()
+        val vcBuilder = VideoCapture.Builder(recorder).setTargetFrameRate(Range(fps, fps))
+
+        // Улучшения картинки на уровне камеры (только если телефон их поддерживает)
+        try {
+            val info = selector.filter(p.availableCameraInfos).firstOrNull()
+            if (info != null) {
+                val c2 = Camera2CameraInfo.from(info)
+                val stab = c2.getCameraCharacteristic(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES)
+                val nr = c2.getCameraCharacteristic(CameraCharacteristics.NOISE_REDUCTION_AVAILABLE_NOISE_REDUCTION_MODES)
+                val edge = c2.getCameraCharacteristic(CameraCharacteristics.EDGE_AVAILABLE_EDGE_MODES)
+                val extenders = listOf<Camera2Interop.Extender<*>>(
+                    Camera2Interop.Extender(previewBuilder),
+                    Camera2Interop.Extender(vcBuilder)
+                )
+                for (ext in extenders) {
+                    if (stab != null && stab.contains(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON)) {
+                        ext.setCaptureRequestOption(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON)
+                    }
+                    if (fps <= 30) {
+                        if (nr != null && nr.contains(CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY)) {
+                            ext.setCaptureRequestOption(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY)
+                        }
+                        if (edge != null && edge.contains(CaptureRequest.EDGE_MODE_HIGH_QUALITY)) {
+                            ext.setCaptureRequestOption(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_HIGH_QUALITY)
+                        }
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            // если что-то не поддерживается, просто снимаем с настройками по умолчанию
+        }
+
+        val preview = previewBuilder.build().also { it.setSurfaceProvider(previewView.surfaceProvider) }
+        val vc = vcBuilder.build()
         try {
             p.unbindAll()
             zoomLive?.removeObserver(zoomObs)
@@ -234,7 +294,14 @@ class MainActivity : AppCompatActivity() {
             zoomLive!!.observe(this, zoomObs)
             zoomSeek.progress = 0
         } catch (e: Exception) {
-            Toast.makeText(this, "Эта камера не поддерживает такое качество: " + e.message, Toast.LENGTH_LONG).show()
+            if (fpsIndex == 1) {
+                fpsIndex = 0
+                fpsSpinner.setSelection(0)
+                Toast.makeText(this, "Такой режим в 60 к/с не поддерживается, включил 30", Toast.LENGTH_LONG).show()
+                bindCamera()
+            } else {
+                Toast.makeText(this, "Эта камера не поддерживает такое качество: " + e.message, Toast.LENGTH_LONG).show()
+            }
         }
     }
 
@@ -280,6 +347,7 @@ class MainActivity : AppCompatActivity() {
     private fun setRecUi(on: Boolean) {
         recBtn.text = if (on) "СТОП" else "ЗАПИСЬ"
         qualitySpinner.isEnabled = !on
+        fpsSpinner.isEnabled = !on
         flipBtn.isEnabled = !on
         if (!on) timerText.text = ""
     }
