@@ -22,7 +22,9 @@ import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
+import androidx.camera.camera2.interop.Camera2CameraControl
 import androidx.camera.camera2.interop.Camera2CameraInfo
+import androidx.camera.camera2.interop.CaptureRequestOptions
 import androidx.camera.camera2.interop.Camera2Interop
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
@@ -67,6 +69,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var flipBtn: Button
     private lateinit var qualitySpinner: Spinner
     private lateinit var fpsSpinner: Spinner
+    private lateinit var nightBtn: Button
+    private lateinit var dayBtn: Button
 
     private var provider: ProcessCameraProvider? = null
     private var camera: Camera? = null
@@ -81,6 +85,7 @@ class MainActivity : AppCompatActivity() {
     private var targetZ = 1f
     private var curZ = 1f
     private var lastApplied = 0f
+    private var mode = 0   // 0 = обычный, 1 = ночной, 2 = дневной (тёплый)
 
     private val qualities = listOf(
         "SD 480p" to Quality.SD,
@@ -130,6 +135,8 @@ class MainActivity : AppCompatActivity() {
         flipBtn = findViewById(R.id.flipBtn)
         qualitySpinner = findViewById(R.id.qualitySpinner)
         fpsSpinner = findViewById(R.id.fpsSpinner)
+        nightBtn = findViewById(R.id.nightBtn)
+        dayBtn = findViewById(R.id.dayBtn)
 
         previewView.scaleType = PreviewView.ScaleType.FIT_CENTER
         previewView.keepScreenOn = true
@@ -179,6 +186,10 @@ class MainActivity : AppCompatActivity() {
                 CameraSelector.LENS_FACING_FRONT else CameraSelector.LENS_FACING_BACK
             bindCamera()
         }
+        nightBtn.setOnClickListener { setMode(if (mode == 1) 0 else 1) }
+        dayBtn.setOnClickListener { setMode(if (mode == 2) 0 else 2) }
+        updateModeUi()
+
         recBtn.setOnClickListener { toggleRecord() }
         findViewById<Button>(R.id.photoBtn).setOnClickListener { takePhoto() }
 
@@ -318,6 +329,7 @@ class MainActivity : AppCompatActivity() {
             zoomLive = camera!!.cameraInfo.zoomState
             zoomLive!!.observe(this, zoomObs)
             zoomSeek.progress = 0
+            applyMode()
         } catch (e: Exception) {
             if (fpsIndex == 1) {
                 fpsIndex = 0
@@ -391,6 +403,61 @@ class MainActivity : AppCompatActivity() {
                 Toast.makeText(this@MainActivity, "Ошибка фото: " + e.message, Toast.LENGTH_LONG).show()
             }
         })
+    }
+
+    private fun setMode(m: Int) {
+        mode = m
+        updateModeUi()
+        applyMode()
+        val msg = when (m) {
+            1 -> "Ночной режим: светлее и меньше шума"
+            2 -> "Дневной режим: тёплая картинка"
+            else -> "Обычный режим"
+        }
+        Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+    }
+
+    private fun updateModeUi() {
+        nightBtn.alpha = if (mode == 1) 1f else 0.55f
+        dayBtn.alpha = if (mode == 2) 1f else 0.55f
+        nightBtn.backgroundTintList = android.content.res.ColorStateList.valueOf(
+            if (mode == 1) 0xFF3F51B5.toInt() else 0xFF444444.toInt())
+        dayBtn.backgroundTintList = android.content.res.ColorStateList.valueOf(
+            if (mode == 2) 0xFFFF9800.toInt() else 0xFF444444.toInt())
+    }
+
+    // Ночной/дневной режим работает сразу для превью, видео и фото (без перезапуска камеры)
+    private fun applyMode() {
+        val cam = camera ?: return
+        try {
+            // 1) яркость: ночью поднимаем экспозицию, иначе стандартная
+            val es = cam.cameraInfo.exposureState
+            if (es.isExposureCompensationSupported) {
+                val r = es.exposureCompensationRange
+                val idx = if (mode == 1) r.upper else 0
+                cam.cameraControl.setExposureCompensationIndex(idx)
+            }
+            // 2) цвет и шумоподавление через Camera2
+            val c2info = Camera2CameraInfo.from(cam.cameraInfo)
+            val awbModes = c2info.getCameraCharacteristic(CameraCharacteristics.CONTROL_AWB_AVAILABLE_MODES)
+            val nrModes = c2info.getCameraCharacteristic(CameraCharacteristics.NOISE_REDUCTION_AVAILABLE_NOISE_REDUCTION_MODES)
+            val b = CaptureRequestOptions.Builder()
+            if (mode == 2 && awbModes != null) {
+                // «облачный дневной» баланс белого делает картинку теплее
+                val warm = when {
+                    awbModes.contains(CaptureRequest.CONTROL_AWB_MODE_CLOUDY_DAYLIGHT) -> CaptureRequest.CONTROL_AWB_MODE_CLOUDY_DAYLIGHT
+                    awbModes.contains(CaptureRequest.CONTROL_AWB_MODE_SHADE) -> CaptureRequest.CONTROL_AWB_MODE_SHADE
+                    else -> null
+                }
+                if (warm != null) b.setCaptureRequestOption(CaptureRequest.CONTROL_AWB_MODE, warm)
+            }
+            if (mode == 1 && nrModes != null && nrModes.contains(CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY)) {
+                b.setCaptureRequestOption(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY)
+            }
+            Camera2CameraControl.from(cam.cameraControl).setCaptureRequestOptions(b.build())
+        } catch (e: Exception) {
+            // если телефон не поддерживает что-то из этого, просто пропускаем
+        }
     }
 
     private fun setRecUi(on: Boolean) {
