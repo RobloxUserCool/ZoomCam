@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<meta name="theme-color" content="#080a10">
+<title>ZoomCam — Downloads</title>
+<style>
+:root{
+  color-scheme:dark;
+  --bg:#080a10;--panel:#10141f;--panel2:#151b29;--line:#252d40;
+  --text:#f4f6fc;--muted:#8d97ad;--blue:#6487ff;--purple:#9b70ff;
+  --green:#63d9a1;--radius:22px;
+}
+*{box-sizing:border-box}
+html{min-height:100%;scroll-behavior:smooth}
+body{
+  margin:0;min-height:100vh;background:
+  radial-gradient(ellipse at 12% 0%,rgba(73,105,255,.17),transparent 38%),
+  radial-gradient(ellipse at 90% 12%,rgba(148,85,255,.13),transparent 32%),var(--bg);
+  color:var(--text);font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
+}
+button,a{-webkit-tap-highlight-color:transparent}
+button{font:inherit}
+.page{width:min(1040px,calc(100% - 36px));margin:0 auto;padding:26px 0 56px}
+.topbar{display:flex;align-items:center;justify-content:space-between;gap:16px}
+.brand{display:flex;align-items:center;gap:12px;font-weight:750;letter-spacing:-.4px}
+.logo{
+  width:42px;height:42px;border-radius:14px;display:grid;place-items:center;
+  background:linear-gradient(145deg,#6f8cff,#925cff);box-shadow:0 8px 28px #617cff40;
+}
+.logo svg{width:23px;height:23px}
+.repo{
+  display:flex;align-items:center;gap:8px;color:#b7c0d4;text-decoration:none;
+  font-size:13px;border:1px solid var(--line);border-radius:999px;padding:10px 13px;
+  background:#ffffff05;transition:.2s;
+}
+.repo:hover{border-color:#637cff88;color:white;transform:translateY(-1px)}
+.hero{padding:78px 0 42px;max-width:720px}
+.eyebrow{display:inline-flex;align-items:center;gap:8px;color:#aebcff;font-size:11px;font-weight:750;letter-spacing:1.6px;text-transform:uppercase}
+.eyebrow:before{content:"";width:7px;height:7px;border-radius:50%;background:#7d91ff;box-shadow:0 0 14px #7d91ff}
+h1{font-size:clamp(42px,8vw,76px);line-height:.99;letter-spacing:-4px;margin:18px 0 18px;font-weight:820}
+h1 span{background:linear-gradient(100deg,#fff 15%,#a9b9ff 58%,#bd9aff);-webkit-background-clip:text;background-clip:text;color:transparent}
+.subtitle{margin:0;color:var(--muted);font-size:16px;line-height:1.7;max-width:510px}
+.section-head{display:flex;justify-content:space-between;align-items:end;gap:14px;margin:18px 0 18px}
+.section-head h2{margin:0;font-size:19px;letter-spacing:-.4px}
+.section-head p{margin:5px 0 0;color:var(--muted);font-size:12px}
+.status{display:inline-flex;align-items:center;gap:7px;color:#aeb7ca;font-size:12px;white-space:nowrap}
+.status i{width:7px;height:7px;border-radius:50%;background:#737e94}
+.cards{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}
+.app-card{
+  position:relative;overflow:hidden;min-height:270px;padding:23px;border:1px solid var(--line);
+  border-radius:var(--radius);background:linear-gradient(145deg,#151b29ed,#0e121bed);
+  box-shadow:0 18px 55px #00000020;transition:transform .25s,border-color .25s,box-shadow .25s;
+}
+.app-card:before{content:"";position:absolute;width:190px;height:190px;right:-85px;top:-100px;border-radius:50%;background:var(--glow);filter:blur(35px);opacity:.24;pointer-events:none}
+.app-card:hover{transform:translateY(-4px);border-color:#647fff75;box-shadow:0 22px 65px #00000045}
+.card-top{display:flex;justify-content:space-between;align-items:start;gap:12px}
+.app-icon{width:54px;height:54px;border-radius:17px;display:grid;place-items:center;background:var(--icon-bg);border:1px solid #ffffff18}
+.app-icon svg{width:28px;height:28px}
+.platform{font-size:10px;letter-spacing:1.2px;font-weight:800;color:#b7c1d8;border:1px solid #ffffff16;background:#ffffff06;border-radius:999px;padding:7px 10px}
+.app-card h3{font-size:23px;letter-spacing:-.7px;margin:23px 0 5px}
+.description{font-size:13px;color:var(--muted);margin:0}
+.meta{display:flex;gap:15px;flex-wrap:wrap;margin-top:19px;color:#8792a9;font-size:11px}
+.meta span{display:flex;align-items:center;gap:6px}
+.meta b{color:#cbd3e4;font-weight:650}
+.card-bottom{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:23px}
+.version{font-size:11px;color:#929db3}
+.download{
+  border:0;border-radius:12px;padding:12px 16px;min-width:130px;
+  color:white;font-weight:750;font-size:12px;text-decoration:none;text-align:center;
+  background:linear-gradient(110deg,#557cff,#875dff);box-shadow:0 7px 22px #627cff35;
+  transition:transform .2s,filter .2s,opacity .2s;cursor:pointer;
+}
+.download:hover{transform:translateY(-2px);filter:brightness(1.12)}
+.download.disabled{background:#252c3b;color:#7f899e;box-shadow:none;cursor:default;pointer-events:none}
+.notice{display:flex;align-items:flex-start;gap:12px;margin-top:18px;padding:15px 17px;border:1px solid #252d40;border-radius:16px;background:#ffffff04;color:#9ca7bc;font-size:12px;line-height:1.6}
+.notice svg{flex:none;width:17px;height:17px;color:#8ea3ff;margin-top:1px}
+.footer{display:flex;justify-content:space-between;align-items:center;gap:14px;margin-top:48px;padding-top:20px;border-top:1px solid #202638;color:#667188;font-size:11px}
+.footer a{color:#929db4;text-decoration:none}
+.footer a:hover{color:white}
+.toast{position:fixed;left:50%;bottom:22px;transform:translate(-50%,20px);opacity:0;pointer-events:none;padding:12px 16px;border:1px solid var(--line);border-radius:12px;background:#171d2a;color:#e9edfa;font-size:12px;transition:.25s;z-index:5}
+.toast.show{opacity:1;transform:translate(-50%,0)}
+@media(max-width:650px){
+ .page{width:min(100% - 28px,520px);padding-top:18px}
+ .hero{padding:62px 0 34px}
+ h1{letter-spacing:-2.6px}
+ .subtitle{font-size:14px}
+ .cards{grid-template-columns:1fr}
+ .app-card{min-height:250px}
+ .footer{margin-top:34px}
+}
+@media(prefers-reduced-motion:reduce){*,*:before,*:after{scroll-behavior:auto!important;transition:none!important}}
+</style>
+</head>
+<body>
+<main class="page">
+  <header class="topbar">
+    <div class="brand">
+      <div class="logo" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 8.5A2.5 2.5 0 0 1 6.5 6h7A2.5 2.5 0 0 1 16 8.5v7a2.5 2.5 0 0 1-2.5 2.5h-7A2.5 2.5 0 0 1 4 15.5z"/><path d="m16 10 4-2v8l-4-2"/><circle cx="10" cy="12" r="2.2"/></svg>
+      </div>
+      <span>ZoomCam</span>
+    </div>
+    <a class="repo" href="https://github.com/RobloxUserCool/ZoomCam" target="_blank" rel="noopener">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 .9a11.1 11.1 0 0 0-3.51 21.63c.56.1.76-.24.76-.54v-2.1c-3.1.67-3.76-1.32-3.76-1.32-.5-1.28-1.24-1.62-1.24-1.62-1.02-.7.08-.69.08-.69 1.13.08 1.72 1.16 1.72 1.16 1 .1.77 2.04 3.6 1.54.1-.72.39-1.21.7-1.49-2.48-.28-5.09-1.24-5.09-5.52 0-1.22.44-2.22 1.16-3-.12-.28-.5-1.42.11-2.96 0 0 .95-.3 3.06 1.15a10.6 10.6 0 0 1 5.57 0c2.12-1.45 3.06-1.15 3.06-1.15.61 1.54.23 2.68.11 2.96.72.78 1.16 1.78 1.16 3 0 4.29-2.61 5.24-5.1 5.52.4.35.75 1.03.75 2.08v3.08c0 .3.2.65.77.54A11.1 11.1 0 0 0 12 .9Z"/></svg>
+      Репозиторий
+    </a>
+  </header>
+
+  <section class="hero">
+    <div class="eyebrow">Официальные загрузки</div>
+    <h1><span>ZoomCam</span><br>Downloads</h1>
+    <p class="subtitle">Выбери платформу и скачай последнюю доступную версию приложения.</p>
+  </section>
+
+  <section aria-labelledby="apps-title">
+    <div class="section-head">
+      <div><h2 id="apps-title">Приложения</h2><p>Версии обновляются автоматически</p></div>
+      <div class="status" id="connection"><i></i><span>Проверка релизов</span></div>
+    </div>
+
+    <div class="cards">
+      <article class="app-card" style="--glow:#5b83ff;--icon-bg:linear-gradient(145deg,#233d7b,#18233f)">
+        <div class="card-top">
+          <div class="app-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="#a9bcff" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3.5" y="5" width="17" height="14" rx="3"/><circle cx="12" cy="12" r="4"/><circle cx="12" cy="12" r="1.4"/><path d="M7 5 8.5 3h4L14 5"/></svg>
+          </div>
+          <span class="platform">ANDROID</span>
+        </div>
+        <h3>ZoomCam</h3>
+        <p class="description">Версия для устройств Android</p>
+        <div class="meta"><span>Формат <b>APK</b></span><span id="android-size">Размер —</span></div>
+        <div class="card-bottom">
+          <span class="version" id="android-version">Релиз не найден</span>
+          <a class="download disabled" id="android-download" href="#" aria-disabled="true">Скоро</a>
+        </div>
+      </article>
+
+      <article class="app-card" style="--glow:#a36aff;--icon-bg:linear-gradient(145deg,#492d78,#271d42)">
+        <div class="card-top">
+          <div class="app-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="#d0b2ff" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="2.5" width="14" height="19" rx="3"/><path d="M9 5h6M10 18.5h4"/><circle cx="12" cy="11.5" r="3"/></svg>
+          </div>
+          <span class="platform">iOS</span>
+        </div>
+        <h3>ZoomCam iOS</h3>
+        <p class="description">Версия для iPhone и iPad</p>
+        <div class="meta"><span>Формат <b>IPA</b></span><span id="ios-size">Размер —</span></div>
+        <div class="card-bottom">
+          <span class="version" id="ios-version">Релиз не найден</span>
+          <a class="download disabled" id="ios-download" href="#" aria-disabled="true">Скоро</a>
+        </div>
+      </article>
+    </div>
+  </section>
+
+  <div class="notice">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 11v5m0-8h.01"/></svg>
+    <div id="notice-text">Проверяем опубликованные версии. Если релизов пока нет, кнопки скачивания появятся после публикации APK или IPA в GitHub Releases.</div>
+  </div>
+
+  <footer class="footer">
+    <span>© <span id="year"></span> ZoomCam</span>
+    <a href="https://github.com/RobloxUserCool/ZoomCam/releases" target="_blank" rel="noopener">Все релизы</a>
+  </footer>
+</main>
+<div class="toast" id="toast" role="status"></div>
+
+<script>
+const OWNER = "RobloxUserCool";
+const REPO = "ZoomCam";
+const RELEASES_API = `https://api.github.com/repos/${OWNER}/${REPO}/releases`;
+
+const $ = (id) => document.getElementById(id);
+
+function formatSize(bytes) {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "Размер неизвестен";
+  const units = ["Б", "КБ", "МБ", "ГБ"];
+  let value = bytes, unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit++;
+  }
+  return `${value.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
+}
+
+function setConnection(message, online = false) {
+  $("connection").innerHTML = `<i style="background:${online ? "#63d9a1" : "#737e94"}"></i><span>${message}</span>`;
+}
+
+function showApp(platform, release, asset) {
+  const prefix = platform === "android" ? "android" : "ios";
+  const version = release.tag_name || release.name || "Последняя версия";
+  const link = $(prefix + "-download");
+
+  $(prefix + "-version").textContent = version;
+  $(prefix + "-size").textContent = formatSize(asset.size);
+  link.href = asset.browser_download_url;
+  link.textContent = "Скачать";
+  link.classList.remove("disabled");
+  link.removeAttribute("aria-disabled");
+  link.setAttribute("download", asset.name);
+  link.setAttribute("aria-label", `Скачать ${asset.name}`);
+}
+
+function findAsset(releases, extension) {
+  for (const release of releases) {
+    const assets = release.assets || [];
+    const asset = assets.find(item => item.name.toLowerCase().endsWith(extension));
+    if (asset) return { release, asset };
+  }
+  return null;
+}
+
+async function loadReleases() {
+  try {
+    const response = await fetch(RELEASES_API, {
+      headers: { "Accept": "application/vnd.github+json" }
+    });
+    if (!response.ok) throw new Error(`GitHub API: ${response.status}`);
+
+    const releases = await response.json();
+    const android = findAsset(releases, ".apk");
+    const ios = findAsset(releases, ".ipa");
+
+    if (android) showApp("android", android.release, android.asset);
+    if (ios) showApp("ios", ios.release, ios.asset);
+
+    if (android || ios) {
+      setConnection("Релизы загружены", true);
+      const missing = [];
+      if (!android) missing.push("APK");
+      if (!ios) missing.push("IPA");
+      $("notice-text").textContent = missing.length
+        ? `Данные получены из GitHub. Пока не опубликован файл: ${missing.join(" и ")}.`
+        : "Обе версии доступны. Ссылки ведут непосредственно на файлы опубликованных GitHub Releases.";
+    } else {
+      setConnection("Релизов пока нет");
+      $("notice-text").textContent = "В репозитории пока нет опубликованных APK и IPA. После добавления файлов в GitHub Releases сайт обнаружит их автоматически.";
+    }
+  } catch (error) {
+    setConnection("Не удалось обновить");
+    $("notice-text").textContent = "Не удалось получить список релизов GitHub. Проверь подключение к интернету и попробуй обновить страницу.";
+    console.error(error);
+  }
+}
+
+$("year").textContent = new Date().getFullYear();
+loadReleases();
+</script>
+</body>
+</html>
