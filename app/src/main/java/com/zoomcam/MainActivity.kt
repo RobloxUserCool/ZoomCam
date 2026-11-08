@@ -4,6 +4,11 @@ import android.Manifest
 import android.annotation.SuppressLint
 import android.content.ContentValues
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Matrix
+import android.media.ExifInterface
+import android.net.Uri
 import android.os.Bundle
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CaptureRequest
@@ -50,6 +55,9 @@ import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LiveData
 import androidx.lifecycle.Observer
+import org.tensorflow.lite.Interpreter
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -71,6 +79,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var fpsSpinner: Spinner
     private lateinit var nightBtn: Button
     private lateinit var dayBtn: Button
+    private lateinit var aiBtn: Button
 
     private var provider: ProcessCameraProvider? = null
     private var camera: Camera? = null
@@ -85,6 +94,9 @@ class MainActivity : AppCompatActivity() {
     private var targetZ = 1f
     private var curZ = 1f
     private var lastApplied = 0f
+    private var aiOn = true
+    private var aiBusy = false
+    private var highZoom = false
     private var mode = 0   // 0 = обычный, 1 = ночной, 2 = дневной (тёплый)
 
     private val qualities = listOf(
@@ -116,6 +128,8 @@ class MainActivity : AppCompatActivity() {
                     camera?.cameraControl?.setZoomRatio(curZ)
                     lastApplied = curZ
                     zoomLabel.text = fmt(curZ) + "x"
+                    val hz = curZ >= 3f
+                    if (hz != highZoom) { highZoom = hz; applyMode() }
                 }
             }
             Choreographer.getInstance().postFrameCallback(this)
@@ -137,6 +151,7 @@ class MainActivity : AppCompatActivity() {
         fpsSpinner = findViewById(R.id.fpsSpinner)
         nightBtn = findViewById(R.id.nightBtn)
         dayBtn = findViewById(R.id.dayBtn)
+        aiBtn = findViewById(R.id.aiBtn)
 
         previewView.scaleType = PreviewView.ScaleType.FIT_CENTER
         previewView.keepScreenOn = true
@@ -188,6 +203,11 @@ class MainActivity : AppCompatActivity() {
         }
         nightBtn.setOnClickListener { setMode(if (mode == 1) 0 else 1) }
         dayBtn.setOnClickListener { setMode(if (mode == 2) 0 else 2) }
+        aiBtn.setOnClickListener {
+            aiOn = !aiOn
+            updateModeUi()
+            Toast.makeText(this, if (aiOn) "ИИ-улучшение фото: вкл" else "ИИ-улучшение фото: выкл", Toast.LENGTH_SHORT).show()
+        }
         updateModeUi()
 
         recBtn.setOnClickListener { toggleRecord() }
@@ -383,6 +403,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun takePhoto() {
         val ic = imageCapture ?: return
+        val shotZoom = curZ
         val name = "ZoomCam_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
         val values = ContentValues().apply {
             put(MediaStore.MediaColumns.DISPLAY_NAME, name)
@@ -398,11 +419,162 @@ class MainActivity : AppCompatActivity() {
         ic.takePicture(out, ContextCompat.getMainExecutor(this), object : ImageCapture.OnImageSavedCallback {
             override fun onImageSaved(r: ImageCapture.OutputFileResults) {
                 Toast.makeText(this@MainActivity, "Фото сохранено в галерею", Toast.LENGTH_SHORT).show()
+                val u = r.savedUri
+                if (aiOn && u != null) enhanceAsync(u, shotZoom, name)
             }
             override fun onError(e: ImageCaptureException) {
                 Toast.makeText(this@MainActivity, "Ошибка фото: " + e.message, Toast.LENGTH_LONG).show()
             }
         })
+    }
+
+    // ---------- ИИ-улучшение фото при зуме ----------
+    private fun enhanceAsync(uri: Uri, zoom: Float, name: String) {
+        if (zoom < 3f) return
+        if (aiBusy) {
+            Toast.makeText(this, "ИИ ещё обрабатывает прошлое фото", Toast.LENGTH_SHORT).show()
+            return
+        }
+        aiBusy = true
+        Toast.makeText(this, "ИИ улучшает фото, это займёт до минуты", Toast.LENGTH_LONG).show()
+        Thread {
+            var msg = ""
+            try {
+                val src = loadNative(uri, zoom)
+                if (src == null) {
+                    msg = "Для ИИ приблизь сильнее (примерно от 6x)"
+                } else {
+                    val big = superRes(src) { pr -> runOnUiThread { infoText.text = "ИИ " + pr + "%" } }
+                    if (big == null) {
+                        msg = "Нет модели esrgan.tflite в приложении"
+                    } else {
+                        saveJpeg(big, name + "_AI")
+                        msg = "ИИ-фото готово: " + big.width + "x" + big.height
+                    }
+                }
+            } catch (e: Throwable) {
+                msg = "ИИ не получилось: " + e.message
+            }
+            runOnUiThread {
+                aiBusy = false
+                infoText.text = "зум до " + fmt(maxZ) + "x"
+                Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+            }
+        }.start()
+    }
+
+    // Фото уже растянуто камерой в zoom раз, возвращаем его к «родному» размеру сенсора (заодно это убирает шум)
+    private fun loadNative(uri: Uri, zoom: Float): Bitmap? {
+        val bo = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bo) }
+        val w0 = bo.outWidth
+        val h0 = bo.outHeight
+        if (w0 <= 0 || h0 <= 0) return null
+        val tw0 = (w0 / zoom).toInt()
+        val th0 = (h0 / zoom).toInt()
+        if (maxOf(tw0, th0) > 800 || minOf(tw0, th0) < 16) return null
+        var sample = 1
+        while (w0 / (sample * 2) >= tw0 && h0 / (sample * 2) >= th0) sample *= 2
+        val o = BitmapFactory.Options().apply { inSampleSize = sample }
+        var bmp = contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, o) } ?: return null
+        val orient = contentResolver.openInputStream(uri)?.use {
+            ExifInterface(it).getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)
+        } ?: ExifInterface.ORIENTATION_NORMAL
+        val deg = when (orient) {
+            ExifInterface.ORIENTATION_ROTATE_90 -> 90f
+            ExifInterface.ORIENTATION_ROTATE_180 -> 180f
+            ExifInterface.ORIENTATION_ROTATE_270 -> 270f
+            else -> 0f
+        }
+        if (deg != 0f) {
+            val m = Matrix().apply { postRotate(deg) }
+            bmp = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, m, true)
+        }
+        val outW = if (deg == 90f || deg == 270f) th0 else tw0
+        val outH = if (deg == 90f || deg == 270f) tw0 else th0
+        return Bitmap.createScaledBitmap(bmp, outW.coerceAtLeast(16), outH.coerceAtLeast(16), true)
+    }
+
+    // ESRGAN x4 по плиткам с нахлёстом, чтобы не было швов
+    private fun superRes(src: Bitmap, progress: (Int) -> Unit): Bitmap? {
+        val bytes = try { assets.open("esrgan.tflite").readBytes() } catch (e: Exception) { return null }
+        val model = ByteBuffer.allocateDirect(bytes.size).order(ByteOrder.nativeOrder())
+        model.put(bytes)
+        model.rewind()
+        val interp = Interpreter(model, Interpreter.Options().setNumThreads(4))
+        try {
+            val inShape = interp.getInputTensor(0).shape()
+            val outShape = interp.getOutputTensor(0).shape()
+            val n = inShape[1]
+            val m = outShape[1]
+            val sc = m / n
+            if (sc < 2) return null
+            val pad = 4
+            val core = n - 2 * pad
+            val w = src.width
+            val h = src.height
+            val pix = IntArray(w * h)
+            src.getPixels(pix, 0, w, 0, 0, w, h)
+            val out = Bitmap.createBitmap(w * sc, h * sc, Bitmap.Config.ARGB_8888)
+            val inBuf = ByteBuffer.allocateDirect(n * n * 3 * 4).order(ByteOrder.nativeOrder())
+            val outBuf = ByteBuffer.allocateDirect(m * m * 3 * 4).order(ByteOrder.nativeOrder())
+            val cols = (w + core - 1) / core
+            val rows = (h + core - 1) / core
+            var done = 0
+            var ty = 0
+            while (ty < h) {
+                var tx = 0
+                while (tx < w) {
+                    inBuf.rewind()
+                    for (y in 0 until n) {
+                        val sy = (ty - pad + y).coerceIn(0, h - 1)
+                        for (x in 0 until n) {
+                            val sx = (tx - pad + x).coerceIn(0, w - 1)
+                            val px = pix[sy * w + sx]
+                            inBuf.putFloat(((px shr 16) and 0xFF).toFloat())
+                            inBuf.putFloat(((px shr 8) and 0xFF).toFloat())
+                            inBuf.putFloat((px and 0xFF).toFloat())
+                        }
+                    }
+                    outBuf.rewind()
+                    interp.run(inBuf, outBuf)
+                    outBuf.rewind()
+                    val fb = outBuf.asFloatBuffer()
+                    val cw = minOf(core, w - tx)
+                    val ch = minOf(core, h - ty)
+                    val tw = cw * sc
+                    val th = ch * sc
+                    val tile = IntArray(tw * th)
+                    for (oy in 0 until th) {
+                        for (ox in 0 until tw) {
+                            val idx = ((pad * sc + oy) * m + (pad * sc + ox)) * 3
+                            val r = fb.get(idx).toInt().coerceIn(0, 255)
+                            val g = fb.get(idx + 1).toInt().coerceIn(0, 255)
+                            val b = fb.get(idx + 2).toInt().coerceIn(0, 255)
+                            tile[oy * tw + ox] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+                        }
+                    }
+                    out.setPixels(tile, 0, tw, tx * sc, ty * sc, tw, th)
+                    done++
+                    if (done % 5 == 0) progress(done * 100 / (cols * rows))
+                    tx += core
+                }
+                ty += core
+            }
+            return out
+        } finally {
+            interp.close()
+        }
+    }
+
+    private fun saveJpeg(bmp: Bitmap, name: String) {
+        val values = ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+            put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
+            put(MediaStore.Images.Media.RELATIVE_PATH, "DCIM/Camera")
+        }
+        val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: return
+        contentResolver.openOutputStream(uri)?.use { bmp.compress(Bitmap.CompressFormat.JPEG, 95, it) }
     }
 
     private fun setMode(m: Int) {
@@ -420,6 +592,9 @@ class MainActivity : AppCompatActivity() {
     private fun updateModeUi() {
         nightBtn.alpha = if (mode == 1) 1f else 0.55f
         dayBtn.alpha = if (mode == 2) 1f else 0.55f
+        aiBtn.alpha = if (aiOn) 1f else 0.55f
+        aiBtn.backgroundTintList = android.content.res.ColorStateList.valueOf(
+            if (aiOn) 0xFF2E7D32.toInt() else 0xFF444444.toInt())
         nightBtn.backgroundTintList = android.content.res.ColorStateList.valueOf(
             if (mode == 1) 0xFF3F51B5.toInt() else 0xFF444444.toInt())
         dayBtn.backgroundTintList = android.content.res.ColorStateList.valueOf(
@@ -441,7 +616,17 @@ class MainActivity : AppCompatActivity() {
             val c2info = Camera2CameraInfo.from(cam.cameraInfo)
             val awbModes = c2info.getCameraCharacteristic(CameraCharacteristics.CONTROL_AWB_AVAILABLE_MODES)
             val nrModes = c2info.getCameraCharacteristic(CameraCharacteristics.NOISE_REDUCTION_AVAILABLE_NOISE_REDUCTION_MODES)
+            val edgeModes = c2info.getCameraCharacteristic(CameraCharacteristics.EDGE_AVAILABLE_EDGE_MODES)
             val b = CaptureRequestOptions.Builder()
+            // сглаживание при сильном зуме: сильное шумоподавление и без излишней резкости (она подчёркивает «квадраты»)
+            if (highZoom && fpsIndex == 0) {
+                if (nrModes != null && nrModes.contains(CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY)) {
+                    b.setCaptureRequestOption(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY)
+                }
+                if (edgeModes != null && edgeModes.contains(CaptureRequest.EDGE_MODE_FAST)) {
+                    b.setCaptureRequestOption(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_FAST)
+                }
+            }
             if (mode == 2 && awbModes != null) {
                 // «облачный дневной» баланс белого делает картинку теплее
                 val warm = when {
