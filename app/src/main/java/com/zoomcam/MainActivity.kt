@@ -6,6 +6,8 @@ import android.content.ContentValues
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.BitmapRegionDecoder
+import android.graphics.Rect
 import android.graphics.Matrix
 import android.media.ExifInterface
 import android.net.Uri
@@ -65,6 +67,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.LiveData
 import androidx.lifecycle.Observer
 import org.tensorflow.lite.Interpreter
+import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.text.SimpleDateFormat
@@ -117,6 +120,10 @@ class MainActivity : AppCompatActivity() {
     private var targetZ = 1f
     private var curZ = 1f
     private var lastApplied = 0f
+    private var hwMaxZ = 1f          // максимум зума самой камеры (у телефона это около x2)
+    private var lastHw = 0f
+    private val virtualMax = 100f    // дальше аппаратного приближаем программно
+    private var lastHint = 0L
     private var aiOn = true
     private var aiBusy = false
     private var highZoom = false
@@ -135,7 +142,8 @@ class MainActivity : AppCompatActivity() {
 
     private val zoomObs = Observer<ZoomState> { z ->
         minZ = z.minZoomRatio
-        maxZ = z.maxZoomRatio
+        hwMaxZ = z.maxZoomRatio
+        maxZ = maxOf(hwMaxZ, virtualMax)
         infoText.text = "зум до " + fmt(maxZ) + "x"
     }
 
@@ -148,7 +156,17 @@ class MainActivity : AppCompatActivity() {
                 val next = exp(ln(c.toDouble()) + (ln(t.toDouble()) - ln(c.toDouble())) * 0.12).toFloat()
                 curZ = if (abs(next - t) < 0.002f * t) t else next
                 if (curZ != lastApplied) {
-                    camera?.cameraControl?.setZoomRatio(curZ)
+                    // до предела камеры зумит сама камера, остальное добираем увеличением картинки
+                    val hw = curZ.coerceIn(minZ, maxOf(minZ, hwMaxZ))
+                    if (hw != lastHw) {
+                        camera?.cameraControl?.setZoomRatio(hw)
+                        lastHw = hw
+                    }
+                    val ex = if (hw > 0f) curZ / hw else 1f
+                    if (previewView.scaleX != ex) {
+                        previewView.scaleX = ex
+                        previewView.scaleY = ex
+                    }
                     lastApplied = curZ
                     zoomLabel.text = fmt(curZ) + "x"
                     if (zoomLabel.alpha < 1f) { zoomLabel.animate().cancel(); zoomLabel.alpha = 1f }
@@ -180,6 +198,7 @@ class MainActivity : AppCompatActivity() {
         dayBtn = findViewById(R.id.dayBtn)
         aiBtn = findViewById(R.id.aiBtn)
 
+        previewView.implementationMode = PreviewView.ImplementationMode.COMPATIBLE
         previewView.scaleType = PreviewView.ScaleType.FIT_CENTER
         previewView.keepScreenOn = true
 
@@ -269,15 +288,27 @@ class MainActivity : AppCompatActivity() {
         })
         val tap = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
             override fun onSingleTapUp(e: MotionEvent): Boolean {
-                val pt = previewView.meteringPointFactory.createPoint(e.x, e.y)
+                val sc = previewView.scaleX
+                val lx = previewView.pivotX + (e.x - previewView.pivotX) / sc
+                val ly = previewView.pivotY + (e.y - previewView.pivotY) / sc
+                val pt = previewView.meteringPointFactory.createPoint(lx, ly)
                 camera?.cameraControl?.startFocusAndMetering(FocusMeteringAction.Builder(pt).build())
                 showFocusRing(e.x, e.y)
                 return true
             }
         })
-        previewView.setOnTouchListener { _, e ->
-            scale.onTouchEvent(e)
-            tap.onTouchEvent(e)
+        previewView.setOnTouchListener { v, e ->
+            // когда картинка увеличена программно, возвращаем координаты пальцев к экранным, иначе щипок перестаёт работать
+            val ev = MotionEvent.obtain(e)
+            val sc = v.scaleX
+            if (sc != 1f) {
+                val m = Matrix()
+                m.setScale(sc, sc, v.pivotX, v.pivotY)
+                ev.transform(m)
+            }
+            scale.onTouchEvent(ev)
+            tap.onTouchEvent(ev)
+            ev.recycle()
             true
         }
 
@@ -391,6 +422,8 @@ class MainActivity : AppCompatActivity() {
             p.unbindAll()
             zoomLive?.removeObserver(zoomObs)
             minZ = 1f; maxZ = 1f; targetZ = 1f; curZ = 1f; lastApplied = 0f
+            hwMaxZ = 1f; lastHw = 0f
+            previewView.scaleX = 1f; previewView.scaleY = 1f
             camera = p.bindToLifecycle(this, selector, preview, vc, ic)
             videoCapture = vc
             imageCapture = ic
@@ -418,6 +451,13 @@ class MainActivity : AppCompatActivity() {
         if (cur != null) {
             cur.stop()
             return
+        }
+        if (curZ > hwMaxZ + 0.01f || targetZ > hwMaxZ + 0.01f) {
+            Toast.makeText(this, "В видео зум только до " + fmt(hwMaxZ) + "x", Toast.LENGTH_SHORT).show()
+            targetZ = hwMaxZ.coerceAtLeast(minZ)
+            curZ = targetZ
+            zoomSeek.progress = zoomToSeek(targetZ)
+            updateZoomChips()
         }
         val name = "ZoomCam_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
         val values = ContentValues().apply {
@@ -453,6 +493,8 @@ class MainActivity : AppCompatActivity() {
     private fun takePhoto() {
         val ic = imageCapture ?: return
         val shotZoom = curZ
+        val hwNow = curZ.coerceIn(minZ, maxOf(minZ, hwMaxZ))
+        val extraZ = if (hwNow > 0f) curZ / hwNow else 1f
         val name = "ZoomCam_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
         val values = ContentValues().apply {
             put(MediaStore.MediaColumns.DISPLAY_NAME, name)
@@ -469,12 +511,66 @@ class MainActivity : AppCompatActivity() {
             override fun onImageSaved(r: ImageCapture.OutputFileResults) {
                 Toast.makeText(this@MainActivity, "Фото сохранено в галерею", Toast.LENGTH_SHORT).show()
                 val u = r.savedUri
-                if (aiOn && u != null) enhanceAsync(u, shotZoom, name)
+                if (u != null && extraZ > 1.02f) {
+                    // зум выше аппаратного: вырезаем центр кадра и растягиваем до полного размера
+                    Thread {
+                        val ok = try { cropUpscale(u, extraZ) } catch (t: Throwable) { false }
+                        runOnUiThread {
+                            if (!ok) {
+                                Toast.makeText(this@MainActivity, "Не удалось приблизить фото", Toast.LENGTH_LONG).show()
+                            } else if (aiOn) {
+                                enhanceAsync(u, shotZoom, name)
+                            }
+                        }
+                    }.start()
+                } else if (aiOn && u != null) {
+                    enhanceAsync(u, shotZoom, name)
+                }
             }
             override fun onError(e: ImageCaptureException) {
                 Toast.makeText(this@MainActivity, "Ошибка фото: " + e.message, Toast.LENGTH_LONG).show()
             }
         })
+    }
+
+    // Программный зум для фото: берём центр снимка и растягиваем обратно до исходного размера
+    private fun cropUpscale(uri: Uri, extra: Float): Boolean {
+        val bytes = contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: return false
+        val bo = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bo)
+        val w0 = bo.outWidth
+        val h0 = bo.outHeight
+        if (w0 <= 0 || h0 <= 0) return false
+        val orient = ExifInterface(java.io.ByteArrayInputStream(bytes))
+            .getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)
+        val deg = when (orient) {
+            ExifInterface.ORIENTATION_ROTATE_90 -> 90f
+            ExifInterface.ORIENTATION_ROTATE_180 -> 180f
+            ExifInterface.ORIENTATION_ROTATE_270 -> 270f
+            else -> 0f
+        }
+        val cw = (w0 / extra).toInt().coerceIn(16, w0)
+        val ch = (h0 / extra).toInt().coerceIn(16, h0)
+        val left = (w0 - cw) / 2
+        val top = (h0 - ch) / 2
+        @Suppress("DEPRECATION")
+        val dec = BitmapRegionDecoder.newInstance(bytes, 0, bytes.size, false) ?: return false
+        var crop = dec.decodeRegion(Rect(left, top, left + cw, top + ch), null)
+        dec.recycle()
+        if (crop == null) return false
+        if (deg != 0f) {
+            val m = Matrix().apply { postRotate(deg) }
+            crop = Bitmap.createBitmap(crop, 0, 0, crop.width, crop.height, m, true)
+        }
+        val swap = deg == 90f || deg == 270f
+        val outW = if (swap) h0 else w0
+        val outH = if (swap) w0 else h0
+        val big = Bitmap.createScaledBitmap(crop, outW, outH, true)
+        val bos = ByteArrayOutputStream()
+        big.compress(Bitmap.CompressFormat.JPEG, 95, bos)
+        val out = contentResolver.openOutputStream(uri, "wt") ?: return false
+        out.use { it.write(bos.toByteArray()) }
+        return true
     }
 
     // ---------- ИИ-улучшение фото при зуме ----------
@@ -886,7 +982,15 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setTarget(z: Float, updateSeek: Boolean = true) {
-        targetZ = z.coerceIn(minZ, maxZ)
+        val lim = if (recording != null) minOf(maxZ, hwMaxZ) else maxZ
+        if (recording != null && z > lim * 1.02f) {
+            val now = System.currentTimeMillis()
+            if (now - lastHint > 2500) {
+                lastHint = now
+                Toast.makeText(this, "Во время записи зум только до " + fmt(lim) + "x", Toast.LENGTH_SHORT).show()
+            }
+        }
+        targetZ = z.coerceIn(minZ, maxOf(minZ, lim))
         if (updateSeek) zoomSeek.progress = zoomToSeek(targetZ)
         updateZoomChips()
     }
