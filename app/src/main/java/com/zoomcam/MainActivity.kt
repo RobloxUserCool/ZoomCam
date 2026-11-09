@@ -1822,6 +1822,12 @@ class MainActivity : AppCompatActivity() {
                 try { vf.getFloat(MediaFormat.KEY_FRAME_RATE).toInt() } catch (e2: Throwable) { 30 }
             }).coerceIn(15, 60)
 
+            // битрейт исходника: результат не должен быть сжат сильнее оригинала, иначе детали пропадают
+            var srcBr = try { vf.getInteger(MediaFormat.KEY_BIT_RATE).toLong() } catch (e: Throwable) { 0L }
+            if (srcBr <= 0L && durUs > 0L) {
+                val len = try { contentResolver.openAssetFileDescriptor(uri, "r")?.use { it.length } ?: 0L } catch (e: Throwable) { 0L }
+                if (len > 0L) srcBr = len * 8_000_000L / durUs
+            }
             // увеличиваем маленькое видео до ~1080p (максимум x2), большое оставляем как есть
             val s0 = (1920f / maxOf(dw, dh)).coerceIn(1f, 2f)
             var outW = dw
@@ -1830,7 +1836,7 @@ class MainActivity : AppCompatActivity() {
             for (s in listOf(s0, 1f)) {
                 outW = align16(dw * s)
                 outH = align16(dh * s)
-                val br = (outW.toLong() * outH * fps * 0.28).toLong().coerceIn(6_000_000L, 45_000_000L).toInt()
+                val br = maxOf((outW.toLong() * outH * fps * 0.28).toLong(), (srcBr * 1.25).toLong()).coerceIn(6_000_000L, 60_000_000L).toInt()
                 val f = MediaFormat.createVideoFormat("video/avc", outW, outH)
                 f.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
                 f.setInteger(MediaFormat.KEY_BIT_RATE, br)
@@ -2236,14 +2242,20 @@ private val GL_FS_FAST = "#extension GL_OES_EGL_image_external : require\n" + GL
 private val GL_FS_S1 = "#extension GL_OES_EGL_image_external : require\n" + GL_PREC +
     "varying vec2 vTex;uniform samplerExternalOES sTex;uniform vec2 uPx;uniform float uDen;" +
     "void main(){" +
-    "vec3 c=texture2D(sTex,vTex).rgb;vec3 acc=c;float ws=1.0;" +
+    "vec3 c=texture2D(sTex,vTex).rgb;vec3 acc=c;float ws=1.0;vec3 wide=c;" +
     "for(int i=-1;i<=1;i++){for(int j=-1;j<=1;j++){" +
     "if(i==0&&j==0)continue;" +
-    "vec3 s=texture2D(sTex,vTex+vec2(float(i),float(j))*uPx).rgb;" +
+    "vec2 o=vec2(float(i),float(j));" +
+    "vec3 s=texture2D(sTex,vTex+o*uPx).rgb;" +
     "vec3 d=s-c;float w=exp(-dot(d,d)*uDen);acc+=s*w;ws+=w;" +
-    "vec3 s2=texture2D(sTex,vTex+vec2(float(i),float(j))*uPx*2.0).rgb;" +
-    "vec3 d2=s2-c;float w2=0.6*exp(-dot(d2,d2)*uDen*1.6);acc+=s2*w2;ws+=w2;}}" +
-    "gl_FragColor=vec4(acc/ws,1.0);}"
+    "vec3 s2=texture2D(sTex,vTex+o*uPx*2.0).rgb;" +
+    "vec3 d2=s2-c;float w2=0.6*exp(-dot(d2,d2)*uDen*1.6);acc+=s2*w2;ws+=w2;" +
+    "wide+=texture2D(sTex,vTex+o*uPx*3.0).rgb;}}" +
+    "vec3 den=acc/ws;wide/=9.0;" +
+    "vec3 k=vec3(0.299,0.587,0.114);" +
+    "float y=dot(den,k);" +
+    "vec3 chroma=mix(den-vec3(y),wide-vec3(dot(wide,k)),0.75);" +
+    "gl_FragColor=vec4(clamp(vec3(y)+chroma,0.0,1.0),1.0);}"
 private val GL_FS_T = GL_PREC +
     "varying vec2 vTex;uniform sampler2D sCur;uniform sampler2D sPrev;uniform vec2 uPx;uniform float uHas;" +
     "float lum(vec3 c){return dot(c,vec3(0.299,0.587,0.114));}" +
@@ -2444,7 +2456,7 @@ private class VideoGl(
         bindQuad(progS1)
         GLES20.glUniformMatrix4fv(loc(progS1, "uTm"), 1, false, tm, 0)
         GLES20.glUniform2f(loc(progS1, "uPx"), 1f / srcW, 1f / srcH)
-        GLES20.glUniform1f(loc(progS1, "uDen"), 250f)
+        GLES20.glUniform1f(loc(progS1, "uDen"), 170f)
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(0x8D65, tex)
         GLES20.glUniform1i(loc(progS1, "sTex"), 0)
@@ -2472,7 +2484,7 @@ private class VideoGl(
         GLES20.glUseProgram(progS3)
         bindQuad(progS3)
         GLES20.glUniform2f(loc(progS3, "uPx"), 1f / outW, 1f / outH)
-        GLES20.glUniform1f(loc(progS3, "uSharp"), (0.6f + 0.3f * (scale - 1f)).coerceAtMost(1f))
+        GLES20.glUniform1f(loc(progS3, "uSharp"), (0.8f + 0.2f * (scale - 1f)).coerceAtMost(1f))
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, fboTex[cur])
         GLES20.glUniform1i(loc(progS3, "sTex"), 0)
