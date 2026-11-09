@@ -624,7 +624,78 @@ class MainActivity : AppCompatActivity() {
     private fun halve(b: Bitmap): Bitmap =
         Bitmap.createScaledBitmap(b, maxOf(1, b.width / 2), maxOf(1, b.height / 2), true)
 
-    // Шумоподавление: цвет берём из сильно размытой копии (убирает цветные точки), яркость слегка сглаживаем в тёмных местах
+    private fun planeOf(bmp: Bitmap): FloatArray {
+        val w = bmp.width
+        val h = bmp.height
+        val px = IntArray(w * h)
+        bmp.getPixels(px, 0, w, 0, 0, w, h)
+        val out = FloatArray(w * h)
+        for (i in px.indices) {
+            val p = px[i]
+            out[i] = 0.299f * ((p shr 16) and 255) + 0.587f * ((p shr 8) and 255) + 0.114f * (p and 255)
+        }
+        return out
+    }
+
+    private fun upPlane(src: FloatArray, sw: Int, sh: Int, dw: Int, dh: Int): FloatArray {
+        val out = FloatArray(dw * dh)
+        val x0 = IntArray(dw); val x1 = IntArray(dw); val xt = FloatArray(dw)
+        for (x in 0 until dw) {
+            val f = (x + 0.5f) * sw / dw - 0.5f
+            val i = floor(f).toInt()
+            x0[x] = i.coerceIn(0, sw - 1); x1[x] = (i + 1).coerceIn(0, sw - 1); xt[x] = f - i
+        }
+        for (y in 0 until dh) {
+            val f = (y + 0.5f) * sh / dh - 0.5f
+            val i = floor(f).toInt()
+            val t = f - i
+            val r0 = i.coerceIn(0, sh - 1) * sw
+            val r1 = (i + 1).coerceIn(0, sh - 1) * sw
+            for (x in 0 until dw) {
+                val a = xt[x]
+                out[y * dw + x] = (src[r0 + x0[x]] * (1 - a) + src[r0 + x1[x]] * a) * (1 - t) +
+                    (src[r1 + x0[x]] * (1 - a) + src[r1 + x1[x]] * a) * t
+            }
+        }
+        return out
+    }
+
+    // оценка уровня шума по медиане отклонений (устойчива к настоящим краям)
+    private fun histSigma(hist: IntArray, n: Int): Float {
+        var acc = 0
+        val half = n / 2
+        for (b in hist.indices) {
+            acc += hist[b]
+            if (acc > half) return (b + 0.5f) / 4f * 1.4826f + 0.05f
+        }
+        return 1f
+    }
+
+    private fun planeSigma(y: FloatArray, base: FloatArray, step: Int): Float {
+        val hist = IntArray(1024)
+        var n = 0
+        var i = 0
+        while (i < y.size) {
+            val b = minOf(1023, (abs(y[i] - base[i]) * 4f).toInt())
+            hist[b]++; n++
+            i += step
+        }
+        return histSigma(hist, n)
+    }
+
+    // сжимаем отклонения от размытой основы: мелкое зерно уходит, настоящие контуры остаются
+    private fun shrinkLevel(y: FloatArray, base: FloatArray, c: Float, sig: Float): FloatArray {
+        val out = FloatArray(y.size)
+        for (i in y.indices) {
+            val b0 = base[i]
+            val d = y[i] - b0
+            val cl = c * sig * (1.3f - 0.6f * minOf(b0, 200f) / 200f)
+            out[i] = b0 + d * d / (d * d + cl * cl + 1e-6f) * d
+        }
+        return out
+    }
+
+    // Шумоподавление: яркость чистим по уровням (пирамида), цвет берём из очень размытой копии
     private fun cleanNoise(bmp: Bitmap, strong: Boolean) {
         val w = bmp.width
         val h = bmp.height
@@ -632,7 +703,10 @@ class MainActivity : AppCompatActivity() {
         val half = halve(bmp)
         val q = halve(half)
         val e = halve(q)
-        val cs = if (strong) e else q
+        val e16 = halve(e)
+        val y8 = planeOf(e)
+        val st = strong || y8.average() < 70.0   // тёмный кадр чистим сильнее
+        val cs = if (st) e16 else e
         val cw = cs.width
         val ch = cs.height
         val cp = IntArray(cw * ch)
@@ -648,16 +722,18 @@ class MainActivity : AppCompatActivity() {
             cb[i] = (b - y) * 0.564f
             cr[i] = (r - y) * 0.713f
         }
-        val hw = half.width
-        val hh = half.height
-        val hp = IntArray(hw * hh)
-        half.getPixels(hp, 0, hw, 0, 0, hw, hh)
-        val yl = FloatArray(hw * hh)
-        for (i in hp.indices) {
-            val p = hp[i]
-            yl[i] = 0.299f * ((p shr 16) and 255) + 0.587f * ((p shr 8) and 255) + 0.114f * (p and 255)
-        }
-        half.recycle(); q.recycle(); e.recycle()
+        val hw = half.width; val hh = half.height
+        val qw = q.width; val qh = q.height
+        val ew = e.width; val eh = e.height
+        val y2 = planeOf(half)
+        val y4 = planeOf(q)
+        half.recycle(); q.recycle(); e.recycle(); e16.recycle()
+
+        val c = if (st) 2.5f else 1.8f
+        var base = upPlane(y8, ew, eh, qw, qh)
+        var r = shrinkLevel(y4, base, c, planeSigma(y4, base, 1))
+        base = upPlane(r, qw, qh, hw, hh)
+        val r2 = shrinkLevel(y2, base, c, planeSigma(y2, base, 2))
 
         val cx0 = IntArray(w); val cx1 = IntArray(w); val cxt = FloatArray(w)
         val hx0 = IntArray(w); val hx1 = IntArray(w); val hxt = FloatArray(w)
@@ -669,10 +745,41 @@ class MainActivity : AppCompatActivity() {
             val hi = floor(fh).toInt()
             hx0[x] = hi.coerceIn(0, hw - 1); hx1[x] = (hi + 1).coerceIn(0, hw - 1); hxt[x] = fh - hi
         }
-        val base = if (strong) 0.20f else 0.08f
-        val gain = if (strong) 0.55f else 0.35f
         val rowsPer = 32
         val buf = IntArray(w * rowsPer)
+
+        // уровень шума на полном разрешении (по каждой третьей точке)
+        val hist = IntArray(1024)
+        var hn = 0
+        var s0 = 0
+        while (s0 < h) {
+            val rows = minOf(rowsPer, h - s0)
+            bmp.getPixels(buf, 0, w, 0, s0, w, rows)
+            var ry = 0
+            while (ry < rows) {
+                val y = s0 + ry
+                val fhy = (y + 0.5f) * hh / h - 0.5f
+                val hyi = floor(fhy).toInt()
+                val hyt = fhy - hyi
+                val hy0 = hyi.coerceIn(0, hh - 1) * hw
+                val hy1 = (hyi + 1).coerceIn(0, hh - 1) * hw
+                var x = 0
+                while (x < w) {
+                    val p = buf[ry * w + x]
+                    val yy = 0.299f * ((p shr 16) and 255) + 0.587f * ((p shr 8) and 255) + 0.114f * (p and 255)
+                    val ah = hxt[x]
+                    val bs = (r2[hy0 + hx0[x]] * (1 - ah) + r2[hy0 + hx1[x]] * ah) * (1 - hyt) +
+                        (r2[hy1 + hx0[x]] * (1 - ah) + r2[hy1 + hx1[x]] * ah) * hyt
+                    hist[minOf(1023, (abs(yy - bs) * 4f).toInt())]++
+                    hn++
+                    x += 3
+                }
+                ry += 3
+            }
+            s0 += rows
+        }
+        val sig1 = histSigma(hist, hn)
+
         var y0 = 0
         while (y0 < h) {
             val rows = minOf(rowsPer, h - y0)
@@ -692,22 +799,21 @@ class MainActivity : AppCompatActivity() {
                 for (x in 0 until w) {
                     val idx = ry * w + x
                     val p = buf[idx]
-                    val r = (p shr 16) and 255
-                    val g = (p shr 8) and 255
-                    val b = p and 255
-                    val yy = 0.299f * r + 0.587f * g + 0.114f * b
+                    val pr = (p shr 16) and 255
+                    val pg = (p shr 8) and 255
+                    val pb = p and 255
+                    val yy = 0.299f * pr + 0.587f * pg + 0.114f * pb
                     val a = cxt[x]
                     val i00 = cy0 + cx0[x]; val i01 = cy0 + cx1[x]
                     val i10 = cy1 + cx0[x]; val i11 = cy1 + cx1[x]
                     val cbv = (cb[i00] * (1 - a) + cb[i01] * a) * (1 - cyt) + (cb[i10] * (1 - a) + cb[i11] * a) * cyt
                     val crv = (cr[i00] * (1 - a) + cr[i01] * a) * (1 - cyt) + (cr[i10] * (1 - a) + cr[i11] * a) * cyt
                     val ah = hxt[x]
-                    val j00 = hy0 + hx0[x]; val j01 = hy0 + hx1[x]
-                    val j10 = hy1 + hx0[x]; val j11 = hy1 + hx1[x]
-                    val ylow = (yl[j00] * (1 - ah) + yl[j01] * ah) * (1 - hyt) + (yl[j10] * (1 - ah) + yl[j11] * ah) * hyt
-                    val dark = 1f - minOf(yy, 160f) / 160f
-                    val wl = base + gain * dark
-                    val ny = yy + (ylow - yy) * wl
+                    val bs = (r2[hy0 + hx0[x]] * (1 - ah) + r2[hy0 + hx1[x]] * ah) * (1 - hyt) +
+                        (r2[hy1 + hx0[x]] * (1 - ah) + r2[hy1 + hx1[x]] * ah) * hyt
+                    val d = yy - bs
+                    val cl = c * sig1 * (1.3f - 0.6f * minOf(bs, 200f) / 200f)
+                    val ny = bs + d * d / (d * d + cl * cl + 1e-6f) * d
                     var nr = ny + 1.403f * crv
                     var nb = ny + 1.773f * cbv
                     var ng = (ny - 0.299f * nr - 0.114f * nb) / 0.587f
