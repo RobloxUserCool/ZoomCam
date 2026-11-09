@@ -1291,6 +1291,10 @@ class MainActivity : AppCompatActivity() {
             val w = vf.getInteger(MediaFormat.KEY_WIDTH)
             val h = vf.getInteger(MediaFormat.KEY_HEIGHT)
             val rot = if (vf.containsKey(MediaFormat.KEY_ROTATION)) vf.getInteger(MediaFormat.KEY_ROTATION) else 0
+            // декодер при выводе на поверхность сам поворачивает кадр, поэтому размер считаем уже с учётом поворота
+            val swapWH = rot == 90 || rot == 270
+            val dw = if (swapWH) h else w
+            val dh = if (swapWH) w else h
             val durUs = if (vf.containsKey(MediaFormat.KEY_DURATION)) vf.getLong(MediaFormat.KEY_DURATION) else 0L
             val fps = (try {
                 vf.getInteger(MediaFormat.KEY_FRAME_RATE)
@@ -1299,13 +1303,13 @@ class MainActivity : AppCompatActivity() {
             }).coerceIn(15, 60)
 
             // увеличиваем маленькое видео до ~1080p (максимум x2), большое оставляем как есть
-            val s0 = (1920f / maxOf(w, h)).coerceIn(1f, 2f)
-            var outW = w
-            var outH = h
+            val s0 = (1920f / maxOf(dw, dh)).coerceIn(1f, 2f)
+            var outW = dw
+            var outH = dh
             var inSurf: Surface? = null
             for (s in listOf(s0, 1f)) {
-                outW = align16(w * s)
-                outH = align16(h * s)
+                outW = align16(dw * s)
+                outH = align16(dh * s)
                 val br = (outW.toLong() * outH * fps * 0.22).toLong().coerceIn(6_000_000L, 45_000_000L).toInt()
                 val f = MediaFormat.createVideoFormat("video/avc", outW, outH)
                 f.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
@@ -1327,7 +1331,7 @@ class MainActivity : AppCompatActivity() {
             val enc = encoder ?: throw IllegalStateException("кодер видео не запустился")
             enc.start()
 
-            val scale = outW.toFloat() / w
+            val scale = outW.toFloat() / dw
             val g = VideoGl(inSurf!!, outW, outH, w, h, 0.7f + 0.5f * (scale - 1f))
             gl = g
             val dec = MediaCodec.createDecoderByType(mime)
@@ -1355,7 +1359,7 @@ class MainActivity : AppCompatActivity() {
             outUri = ou
             pfd = contentResolver.openFileDescriptor(ou, "rw")
             val mx = MediaMuxer(pfd!!.fileDescriptor, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
-            mx.setOrientationHint(rot)
+            mx.setOrientationHint(0)
             muxer = mx
 
             val dinfo = MediaCodec.BufferInfo()
