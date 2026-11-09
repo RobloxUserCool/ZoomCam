@@ -11,6 +11,17 @@ import android.graphics.Rect
 import android.graphics.Matrix
 import android.media.ExifInterface
 import android.net.Uri
+import android.content.ContentResolver
+import android.content.ContentUris
+import android.content.Intent
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
+import android.util.LruCache
+import android.view.ViewOutlineProvider
+import android.widget.BaseAdapter
+import android.widget.GridView
+import androidx.activity.OnBackPressedCallback
+import java.util.concurrent.Executors
 import android.graphics.SurfaceTexture
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
@@ -124,6 +135,35 @@ class MainActivity : AppCompatActivity() {
     private var dlgStatus: TextView? = null
     private var dlgPreview: ImageView? = null
     private var dlgPick: TextView? = null
+    private var galleryBtn: ImageView? = null
+    private var galleryRoot: FrameLayout? = null
+    private var galleryAdapter: BaseAdapter? = null
+    private var galleryItems: List<MediaItem> = emptyList()
+    private var galleryAll = false
+    private var galleryEmpty: TextView? = null
+    private var chipLast: TextView? = null
+    private var chipAll: TextView? = null
+    private var viewerRoot: FrameLayout? = null
+    private var viewerImg: ImageView? = null
+    private var viewerPlay: View? = null
+    private var viewerCount: TextView? = null
+    private var viewerIndex = 0
+    private var viewerSeq = 0
+    private var pendingGallery = false
+    private var askedGalleryPerm = false
+    private val thumbPool = Executors.newFixedThreadPool(3)
+    private val thumbCache = object : LruCache<Long, Bitmap>(maxOf(16 * 1024, (Runtime.getRuntime().maxMemory() / 1024 / 8).toInt())) {
+        override fun sizeOf(key: Long, value: Bitmap): Int = value.byteCount / 1024
+    }
+    private val galleryPerm = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { _ ->
+        loadLastThumb()
+        if (pendingGallery) { pendingGallery = false; openGallery() }
+    }
+    private val backCb = object : OnBackPressedCallback(false) {
+        override fun handleOnBackPressed() {
+            if (viewerRoot != null) closeViewer() else closeGallery()
+        }
+    }
     private val pickPhoto = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) enhancePicked(uri)
     }
@@ -290,6 +330,8 @@ class MainActivity : AppCompatActivity() {
         dayBtn.setOnClickListener { setMode(if (mode == 2) 0 else 2) }
         aiBtn.setOnClickListener { showEnhanceDialog() }
         addExtraButtons()
+        addGalleryButton()
+        onBackPressedDispatcher.addCallback(this, backCb)
         updateModeUi()
 
         recBtn.setOnClickListener { toggleRecord() }
@@ -363,6 +405,7 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         Choreographer.getInstance().postFrameCallback(frameCb)
+        loadLastThumb()
     }
 
     override fun onPause() {
@@ -524,6 +567,7 @@ class MainActivity : AppCompatActivity() {
                 is VideoRecordEvent.Finalize -> {
                     recording = null
                     isRecording = false
+                    ui.postDelayed({ loadLastThumb() }, 1200)
                     setRecUi(false)
                     applyMode()
                     if (ev.hasError()) {
@@ -571,6 +615,7 @@ class MainActivity : AppCompatActivity() {
                             } else {
                                 Toast.makeText(this@MainActivity, "Не удалось очистить фото, оставил как есть", Toast.LENGTH_LONG).show()
                             }
+                            loadLastThumb()
                             if ((ok || extraZ <= 1.02f) && aiOn) enhanceAsync(u, shotZoom, name)
                         }
                     }.start()
@@ -848,6 +893,478 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // ---------- Галерея ----------
+    private fun dpx(v: Float) = (v * resources.displayMetrics.density).toInt()
+
+    private fun mediaPerms(): Array<String> =
+        if (Build.VERSION.SDK_INT >= 33) arrayOf("android.permission.READ_MEDIA_IMAGES", "android.permission.READ_MEDIA_VIDEO")
+        else arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE)
+
+    private fun hasMediaPerm(): Boolean =
+        if (Build.VERSION.SDK_INT >= 33) hasPerm("android.permission.READ_MEDIA_IMAGES")
+        else hasPerm(Manifest.permission.READ_EXTERNAL_STORAGE)
+
+    // только список (id и тип), без картинок: поэтому открывается мгновенно даже на тысячах фото
+    private fun queryMedia(limit: Int): List<MediaItem> {
+        val out = ArrayList<MediaItem>()
+        try {
+            val uri = MediaStore.Files.getContentUri("external")
+            val idc = MediaStore.Files.FileColumns._ID
+            val tc = MediaStore.Files.FileColumns.MEDIA_TYPE
+            val b = Bundle().apply {
+                putString(ContentResolver.QUERY_ARG_SQL_SELECTION, tc + "=? OR " + tc + "=?")
+                putStringArray(ContentResolver.QUERY_ARG_SQL_SELECTION_ARGS, arrayOf("1", "3"))
+                putString(ContentResolver.QUERY_ARG_SQL_SORT_ORDER, MediaStore.Files.FileColumns.DATE_ADDED + " DESC, " + idc + " DESC")
+                if (limit > 0) putInt(ContentResolver.QUERY_ARG_LIMIT, limit)
+            }
+            contentResolver.query(uri, arrayOf(idc, tc), b, null)?.use { c ->
+                while (c.moveToNext()) {
+                    val id = c.getLong(0)
+                    val video = c.getInt(1) == 3
+                    val u = ContentUris.withAppendedId(
+                        if (video) MediaStore.Video.Media.EXTERNAL_CONTENT_URI else MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id)
+                    out.add(MediaItem(id, video, u))
+                }
+            }
+        } catch (e: Throwable) {
+        }
+        return out
+    }
+
+    private fun loadThumb(item: MediaItem, px: Int): Bitmap? {
+        return try {
+            if (Build.VERSION.SDK_INT >= 29) {
+                contentResolver.loadThumbnail(item.uri, android.util.Size(px, px), null)
+            } else if (item.video) {
+                val r = MediaMetadataRetriever()
+                try {
+                    r.setDataSource(this, item.uri)
+                    r.getFrameAtTime(0)
+                } finally {
+                    try { r.release() } catch (t: Throwable) {}
+                }
+            } else {
+                loadForEnhance(item.uri, px)
+            }
+        } catch (e: Throwable) {
+            null
+        }
+    }
+
+    private fun thumbKey(m: MediaItem): Long = m.id * 2 + (if (m.video) 1 else 0)
+
+    private fun loadLastThumb() {
+        val btn = galleryBtn ?: return
+        thumbPool.execute {
+            val m = queryMedia(1).firstOrNull() ?: return@execute
+            val b = loadThumb(m, 240) ?: return@execute
+            runOnUiThread { btn.setImageBitmap(b) }
+        }
+    }
+
+    private fun chipBg(on: Boolean): GradientDrawable = GradientDrawable().apply {
+        setColor(if (on) 0xFFFFFFFF.toInt() else 0x2EFFFFFF)
+        cornerRadius = dpx(40f).toFloat()
+    }
+
+    private fun makeChip(label: String): TextView {
+        val t = TextView(this)
+        t.text = label
+        t.textSize = 14f
+        t.setTextColor(0xFFFFFFFF.toInt())
+        t.typeface = Typeface.DEFAULT_BOLD
+        t.gravity = Gravity.CENTER
+        t.setPadding(dpx(14f), dpx(8f), dpx(14f), dpx(8f))
+        t.background = chipBg(false)
+        pressFx(t)
+        return t
+    }
+
+    private fun setChip(t: TextView?, on: Boolean) {
+        if (t == null) return
+        t.background = chipBg(on)
+        t.setTextColor(if (on) 0xFF000000.toInt() else 0xFFFFFFFF.toInt())
+    }
+
+    // круглая миниатюра последнего фото в нижнем углу, ставится рядом с кнопкой съёмки, не поверх других кнопок
+    private fun addGalleryButton() {
+        val size = dpx(54f)
+        val iv = ImageView(this)
+        iv.scaleType = ImageView.ScaleType.CENTER_CROP
+        iv.setPadding(dpx(2f), dpx(2f), dpx(2f), dpx(2f))
+        iv.background = GradientDrawable().apply {
+            setColor(0xFF26262C.toInt())
+            setStroke(dpx(2f), 0xCCFFFFFF.toInt())
+            cornerRadius = dpx(16f).toFloat()
+        }
+        iv.outlineProvider = object : ViewOutlineProvider() {
+            override fun getOutline(view: View, outline: android.graphics.Outline) {
+                outline.setRoundRect(0, 0, view.width, view.height, dpx(16f).toFloat())
+            }
+        }
+        iv.clipToOutline = true
+        iv.alpha = 0f
+        val lp = FrameLayout.LayoutParams(size, size, Gravity.TOP or Gravity.START)
+        lp.leftMargin = dpx(20f)
+        lp.topMargin = resources.displayMetrics.heightPixels - dpx(120f)
+        findViewById<ViewGroup>(android.R.id.content).addView(iv, lp)
+        iv.setOnClickListener { onGalleryTap() }
+        pressFx(iv)
+        galleryBtn = iv
+        ui.postDelayed({ placeGalleryBtn() }, 800)
+    }
+
+    private fun placeGalleryBtn() {
+        val iv = galleryBtn ?: return
+        val photo = findViewById<View>(R.id.photoBtn)
+        val content = findViewById<ViewGroup>(android.R.id.content)
+        val cl = IntArray(2)
+        content.getLocationOnScreen(cl)
+        val pl = IntArray(2)
+        photo.getLocationOnScreen(pl)
+        val size = dpx(54f)
+        val cy = pl[1] - cl[1] + photo.height / 2
+        val blockers = ArrayList<View>()
+        blockers.add(photo); blockers.add(recBtn); blockers.add(flipBtn); blockers.add(qualityPill); blockers.add(fpsPill)
+        blockers.add(nightBtn); blockers.add(dayBtn); blockers.add(aiBtn)
+        if (this::focusBtn.isInitialized) { blockers.add(focusBtn); blockers.add(stabBtn) }
+        fun hits(left: Int): Boolean {
+            val r = Rect(left - dpx(6f), cy - size / 2 - dpx(6f), left + size + dpx(6f), cy + size / 2 + dpx(6f))
+            for (v in blockers) {
+                if (v.visibility != View.VISIBLE || v.width == 0) continue
+                val l = IntArray(2)
+                v.getLocationOnScreen(l)
+                val r2 = Rect(l[0] - cl[0], l[1] - cl[1], l[0] - cl[0] + v.width, l[1] - cl[1] + v.height)
+                if (Rect.intersects(r, r2)) return true
+            }
+            return false
+        }
+        val leftX = dpx(20f)
+        val rightX = content.width - dpx(20f) - size
+        val x = if (!hits(leftX)) leftX else if (!hits(rightX)) rightX else leftX
+        val lp = iv.layoutParams as FrameLayout.LayoutParams
+        lp.leftMargin = x
+        lp.topMargin = cy - size / 2
+        iv.layoutParams = lp
+        iv.animate().alpha(1f).setDuration(300).start()
+    }
+
+    private fun onGalleryTap() {
+        if (!hasMediaPerm() && !askedGalleryPerm) {
+            askedGalleryPerm = true
+            pendingGallery = true
+            galleryPerm.launch(mediaPerms())
+            return
+        }
+        openGallery()
+    }
+
+    @Suppress("DEPRECATION")
+    private fun openGallery() {
+        if (galleryRoot != null) return
+        val content = findViewById<ViewGroup>(android.R.id.content)
+        val root = FrameLayout(this)
+        root.setBackgroundColor(0xF2090A0E.toInt())
+        root.isClickable = true
+
+        val col = LinearLayout(this)
+        col.orientation = LinearLayout.VERTICAL
+        val bar = LinearLayout(this)
+        bar.orientation = LinearLayout.HORIZONTAL
+        bar.gravity = Gravity.CENTER_VERTICAL
+        bar.setPadding(dpx(16f), dpx(14f), dpx(12f), dpx(10f))
+        val title = TextView(this)
+        title.text = "Галерея"
+        title.textSize = 22f
+        title.typeface = Typeface.DEFAULT_BOLD
+        title.setTextColor(0xFFFFFFFF.toInt())
+        bar.addView(title, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        val cl = makeChip("Последние")
+        val ca = makeChip("Все")
+        val cx = makeChip("✕")
+        chipLast = cl
+        chipAll = ca
+        galleryAll = false
+        setChip(cl, true)
+        setChip(ca, false)
+        val gap = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        gap.leftMargin = dpx(8f)
+        bar.addView(cl, gap)
+        bar.addView(ca, LinearLayout.LayoutParams(gap))
+        bar.addView(cx, LinearLayout.LayoutParams(gap))
+        col.addView(bar, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+
+        val cols = if (resources.displayMetrics.widthPixels > dpx(700f)) 5 else 3
+        val grid = GridView(this)
+        grid.numColumns = cols
+        grid.horizontalSpacing = dpx(2f)
+        grid.verticalSpacing = dpx(2f)
+        grid.stretchMode = GridView.STRETCH_COLUMN_WIDTH
+        grid.setSelector(android.R.color.transparent)
+        grid.overScrollMode = View.OVER_SCROLL_NEVER
+        grid.clipToPadding = false
+        grid.isFastScrollEnabled = true
+        val adapter = object : BaseAdapter() {
+            override fun getCount() = galleryItems.size
+            override fun getItem(p: Int): Any = galleryItems[p]
+            override fun getItemId(p: Int) = p.toLong()
+            override fun getView(p: Int, cv: View?, parent: ViewGroup?): View {
+                val ctx = this@MainActivity
+                val cell = (cv as? SquareFrame) ?: SquareFrame(ctx).also { f ->
+                    val iv = ImageView(ctx)
+                    iv.scaleType = ImageView.ScaleType.CENTER_CROP
+                    iv.setBackgroundColor(0xFF1B1C22.toInt())
+                    f.addView(iv, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+                    val bd = TextView(ctx)
+                    bd.text = "▶"
+                    bd.textSize = 12f
+                    bd.setTextColor(0xFFFFFFFF.toInt())
+                    bd.setPadding(dpx(7f), dpx(2f), dpx(7f), dpx(3f))
+                    bd.background = GradientDrawable().apply {
+                        setColor(0x99000000.toInt())
+                        cornerRadius = dpx(20f).toFloat()
+                    }
+                    val blp = FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM or Gravity.START)
+                    blp.leftMargin = dpx(6f)
+                    blp.bottomMargin = dpx(6f)
+                    f.addView(bd, blp)
+                }
+                val iv = cell.getChildAt(0) as ImageView
+                val badge = cell.getChildAt(1)
+                val m = galleryItems[p]
+                badge.visibility = if (m.video) View.VISIBLE else View.GONE
+                val key = thumbKey(m)
+                iv.tag = key
+                iv.animate().cancel()
+                val c = thumbCache.get(key)
+                if (c != null) {
+                    iv.setImageBitmap(c)
+                    iv.alpha = 1f
+                } else {
+                    iv.setImageDrawable(null)
+                    iv.alpha = 0f
+                    thumbPool.execute {
+                        if ((iv.tag as? Long) != key) return@execute
+                        val b = loadThumb(m, 320) ?: return@execute
+                        thumbCache.put(key, b)
+                        runOnUiThread {
+                            if ((iv.tag as? Long) == key) {
+                                iv.setImageBitmap(b)
+                                iv.animate().alpha(1f).setDuration(160).start()
+                            }
+                        }
+                    }
+                }
+                return cell
+            }
+        }
+        galleryAdapter = adapter
+        grid.adapter = adapter
+        grid.setOnItemClickListener { _, _, pos, _ -> openViewer(pos) }
+        col.addView(grid, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+        root.addView(col, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+
+        val empty = TextView(this)
+        empty.textSize = 16f
+        empty.gravity = Gravity.CENTER
+        empty.setTextColor(0xB3FFFFFF.toInt())
+        empty.visibility = View.GONE
+        galleryEmpty = empty
+        root.addView(empty, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER))
+
+        cl.setOnClickListener { if (galleryAll) { galleryAll = false; setChip(cl, true); setChip(ca, false); reloadGallery() } }
+        ca.setOnClickListener { if (!galleryAll) { galleryAll = true; setChip(cl, false); setChip(ca, true); reloadGallery() } }
+        cx.setOnClickListener { closeGallery() }
+
+        root.setOnApplyWindowInsetsListener { _, ins ->
+            bar.setPadding(dpx(16f), ins.systemWindowInsetTop + dpx(14f), dpx(12f), dpx(10f))
+            grid.setPadding(0, 0, 0, ins.systemWindowInsetBottom)
+            ins
+        }
+        content.addView(root, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        root.requestApplyInsets()
+        galleryRoot = root
+        backCb.isEnabled = true
+        root.alpha = 0f
+        root.scaleX = 1.04f
+        root.scaleY = 1.04f
+        root.animate().alpha(1f).scaleX(1f).scaleY(1f).setDuration(220).setInterpolator(DecelerateInterpolator()).start()
+        reloadGallery()
+    }
+
+    private fun reloadGallery() {
+        val limit = if (galleryAll) 0 else 90
+        Thread {
+            val list = queryMedia(limit)
+            runOnUiThread {
+                if (galleryRoot == null) return@runOnUiThread
+                galleryItems = list
+                galleryAdapter?.notifyDataSetChanged()
+                val e = galleryEmpty
+                if (e != null) {
+                    if (list.isEmpty()) {
+                        if (hasMediaPerm()) {
+                            e.text = "Пока пусто"
+                            e.setOnClickListener(null)
+                        } else {
+                            e.text = "Нет доступа к фото\nНажми, чтобы разрешить"
+                            e.setOnClickListener { galleryPerm.launch(mediaPerms()) }
+                        }
+                        e.visibility = View.VISIBLE
+                    } else {
+                        e.visibility = View.GONE
+                    }
+                }
+            }
+        }.start()
+    }
+
+    private fun closeGallery() {
+        val r = galleryRoot ?: return
+        galleryRoot = null
+        viewerRoot = null
+        viewerImg = null
+        viewerPlay = null
+        viewerCount = null
+        viewerSeq++
+        backCb.isEnabled = false
+        r.animate().alpha(0f).setDuration(180).withEndAction { (r.parent as? ViewGroup)?.removeView(r) }.start()
+        loadLastThumb()
+    }
+
+    private fun closeViewer() {
+        val v = viewerRoot ?: return
+        viewerRoot = null
+        viewerImg = null
+        viewerPlay = null
+        viewerCount = null
+        viewerSeq++
+        v.animate().alpha(0f).setDuration(150).withEndAction { (v.parent as? ViewGroup)?.removeView(v) }.start()
+    }
+
+    private fun openExternal(m: MediaItem) {
+        try {
+            val i = Intent(Intent.ACTION_VIEW)
+            i.setDataAndType(m.uri, if (m.video) "video/*" else "image/*")
+            i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            startActivity(i)
+        } catch (e: Throwable) {
+            Toast.makeText(this, "Не нашёл приложение, чтобы открыть", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun openViewer(index: Int) {
+        val root = galleryRoot ?: return
+        if (viewerRoot != null) return
+        val v = FrameLayout(this)
+        v.setBackgroundColor(0xFF000000.toInt())
+        v.isClickable = true
+        val img = ImageView(this)
+        img.scaleType = ImageView.ScaleType.FIT_CENTER
+        v.addView(img, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        val play = TextView(this)
+        play.text = "▶"
+        play.textSize = 30f
+        play.gravity = Gravity.CENTER
+        play.setTextColor(0xFFFFFFFF.toInt())
+        play.background = GradientDrawable().apply {
+            shape = GradientDrawable.OVAL
+            setColor(0x88000000.toInt())
+        }
+        v.addView(play, FrameLayout.LayoutParams(dpx(80f), dpx(80f), Gravity.CENTER))
+        val back = makeChip("←")
+        val blp = FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP or Gravity.START)
+        blp.leftMargin = dpx(14f)
+        blp.topMargin = dpx(14f)
+        v.addView(back, blp)
+
+        val row = LinearLayout(this)
+        row.orientation = LinearLayout.HORIZONTAL
+        row.gravity = Gravity.CENTER_VERTICAL
+        row.setPadding(dpx(16f), dpx(10f), dpx(16f), dpx(26f))
+        val count = TextView(this)
+        count.textSize = 14f
+        count.setTextColor(0xB3FFFFFF.toInt())
+        row.addView(count, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        val enh = makeChip("✨ Улучшить")
+        val opn = makeChip("Открыть")
+        row.addView(enh)
+        val olp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        olp.leftMargin = dpx(8f)
+        row.addView(opn, olp)
+        v.addView(row, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM))
+
+        back.setOnClickListener { closeViewer() }
+        opn.setOnClickListener { galleryItems.getOrNull(viewerIndex)?.let { openExternal(it) } }
+        enh.setOnClickListener {
+            val m = galleryItems.getOrNull(viewerIndex) ?: return@setOnClickListener
+            if (aiBusy) {
+                Toast.makeText(this, "Подожди, ИИ ещё обрабатывает прошлый файл", Toast.LENGTH_SHORT).show()
+            } else {
+                closeGallery()
+                Toast.makeText(this, "ИИ улучшает, процент виден на экране камеры, результат будет в галерее", Toast.LENGTH_LONG).show()
+                enhancePicked(m.uri)
+            }
+        }
+        val gd = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
+            override fun onFling(e1: MotionEvent?, e2: MotionEvent, vx: Float, vy: Float): Boolean {
+                if (abs(vx) > abs(vy) && abs(vx) > 700f) {
+                    if (vx < 0) showViewerItem(viewerIndex + 1, 1) else showViewerItem(viewerIndex - 1, -1)
+                    return true
+                }
+                return false
+            }
+            override fun onSingleTapUp(e: MotionEvent): Boolean {
+                val m = galleryItems.getOrNull(viewerIndex)
+                if (m != null && m.video) openExternal(m)
+                return true
+            }
+        })
+        v.setOnTouchListener { _, e -> gd.onTouchEvent(e); true }
+        v.setOnApplyWindowInsetsListener { _, ins ->
+            val lp = back.layoutParams as FrameLayout.LayoutParams
+            lp.topMargin = ins.systemWindowInsetTop + dpx(14f)
+            back.layoutParams = lp
+            row.setPadding(dpx(16f), dpx(10f), dpx(16f), ins.systemWindowInsetBottom + dpx(26f))
+            ins
+        }
+        root.addView(v, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        v.requestApplyInsets()
+        viewerRoot = v
+        viewerImg = img
+        viewerPlay = play
+        viewerCount = count
+        v.alpha = 0f
+        v.animate().alpha(1f).setDuration(160).start()
+        showViewerItem(index, 0)
+    }
+
+    private fun showViewerItem(i: Int, dir: Int) {
+        val items = galleryItems
+        if (i < 0 || i >= items.size) return
+        val img = viewerImg ?: return
+        viewerIndex = i
+        val seq = ++viewerSeq
+        val m = items[i]
+        viewerCount?.text = (i + 1).toString() + " / " + items.size
+        viewerPlay?.visibility = if (m.video) View.VISIBLE else View.GONE
+        img.animate().cancel()
+        if (dir != 0) {
+            img.translationX = dir * img.width * 0.25f
+            img.alpha = 0.2f
+            img.animate().translationX(0f).alpha(1f).setDuration(200).start()
+        } else {
+            img.translationX = 0f
+            img.alpha = 1f
+        }
+        img.setImageBitmap(thumbCache.get(thumbKey(m)))
+        thumbPool.execute {
+            val big = (if (m.video) loadThumb(m, 1280) else loadForEnhance(m.uri, 2048)) ?: return@execute
+            runOnUiThread { if (seq == viewerSeq) viewerImg?.setImageBitmap(big) }
+        }
+    }
+
     // ---------- Кнопки: фиксация фокуса и стабилизация ----------
     // 0 = нет, 1 = оптическая, 2 = электронная
     private fun stabKind(cam: Camera): Int {
@@ -975,6 +1492,7 @@ class MainActivity : AppCompatActivity() {
             runOnUiThread {
                 aiBusy = false
                 infoText.text = "зум до " + fmt(maxZ) + "x"
+                loadLastThumb()
                 Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
             }
         }.start()
@@ -1204,6 +1722,7 @@ class MainActivity : AppCompatActivity() {
                 aiBusy = false
                 dlgPick?.alpha = 1f
                 infoText.text = "зум до " + fmt(maxZ) + "x"
+                loadLastThumb()
                 setEnhanceUi(msg, null, prev)
                 Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
             }
@@ -1242,6 +1761,7 @@ class MainActivity : AppCompatActivity() {
                 aiBusy = false
                 dlgPick?.alpha = 1f
                 infoText.text = "зум до " + fmt(maxZ) + "x"
+                loadLastThumb()
                 setEnhanceUi(msg, null, prev)
                 Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
             }
@@ -1310,7 +1830,7 @@ class MainActivity : AppCompatActivity() {
             for (s in listOf(s0, 1f)) {
                 outW = align16(dw * s)
                 outH = align16(dh * s)
-                val br = (outW.toLong() * outH * fps * 0.22).toLong().coerceIn(6_000_000L, 45_000_000L).toInt()
+                val br = (outW.toLong() * outH * fps * 0.28).toLong().coerceIn(6_000_000L, 45_000_000L).toInt()
                 val f = MediaFormat.createVideoFormat("video/avc", outW, outH)
                 f.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
                 f.setInteger(MediaFormat.KEY_BIT_RATE, br)
@@ -1332,7 +1852,7 @@ class MainActivity : AppCompatActivity() {
             enc.start()
 
             val scale = outW.toFloat() / dw
-            val g = VideoGl(inSurf!!, outW, outH, w, h, 0.7f + 0.5f * (scale - 1f))
+            val g = VideoGl(inSurf!!, outW, outH, w, h, scale)
             gl = g
             val dec = MediaCodec.createDecoderByType(mime)
             decoder = dec
@@ -1692,22 +2212,92 @@ class MainActivity : AppCompatActivity() {
 
 private class TooSlow(val factor: Float) : Exception("слишком долго")
 
-// GPU-фильтр для видео: кадр с декодера -> шумоподавление с сохранением краёв + резкость -> окно кодера
+// GPU-конвейер для видео: 1) убираем шум и «квадраты» сжатия (с сохранением краёв) и увеличиваем,
+// 2) смешиваем с прошлым кадром там, где картинка неподвижна (меньше мерцания и «каши»), 3) умная резкость.
+private val GL_PREC = "#ifdef GL_FRAGMENT_PRECISION_HIGH\nprecision highp float;\n#else\nprecision mediump float;\n#endif\n"
+private val GL_VS_EXT = "uniform mat4 uTm;attribute vec4 aPos;attribute vec2 aTex;varying vec2 vTex;" +
+    "void main(){gl_Position=aPos;vTex=(uTm*vec4(aTex,0.0,1.0)).xy;}"
+private val GL_VS_2D = "attribute vec4 aPos;attribute vec2 aTex;varying vec2 vTex;" +
+    "void main(){gl_Position=aPos;vTex=aTex;}"
+private val GL_FS_FAST = "#extension GL_OES_EGL_image_external : require\n" + GL_PREC +
+    "varying vec2 vTex;uniform samplerExternalOES sTex;" +
+    "uniform vec2 uPx;uniform float uDen;uniform float uSharp;" +
+    "void main(){" +
+    "vec3 c=texture2D(sTex,vTex).rgb;vec3 acc=c;float ws=1.0;vec3 mean=c;" +
+    "for(int i=-1;i<=1;i++){for(int j=-1;j<=1;j++){" +
+    "if(i==0&&j==0)continue;" +
+    "vec3 s=texture2D(sTex,vTex+vec2(float(i),float(j))*uPx).rgb;" +
+    "vec3 d=s-c;float w=exp(-dot(d,d)*uDen);acc+=s*w;ws+=w;mean+=s;}}" +
+    "vec3 den=acc/ws;vec3 blur=mean/9.0;" +
+    "vec3 o=den+(den-blur)*uSharp;" +
+    "float l=dot(o,vec3(0.299,0.587,0.114));" +
+    "o=mix(vec3(l),o,1.08);o=(o-0.5)*1.04+0.5;" +
+    "gl_FragColor=vec4(clamp(o,0.0,1.0),1.0);}"
+private val GL_FS_S1 = "#extension GL_OES_EGL_image_external : require\n" + GL_PREC +
+    "varying vec2 vTex;uniform samplerExternalOES sTex;uniform vec2 uPx;uniform float uDen;" +
+    "void main(){" +
+    "vec3 c=texture2D(sTex,vTex).rgb;vec3 acc=c;float ws=1.0;" +
+    "for(int i=-1;i<=1;i++){for(int j=-1;j<=1;j++){" +
+    "if(i==0&&j==0)continue;" +
+    "vec3 s=texture2D(sTex,vTex+vec2(float(i),float(j))*uPx).rgb;" +
+    "vec3 d=s-c;float w=exp(-dot(d,d)*uDen);acc+=s*w;ws+=w;" +
+    "vec3 s2=texture2D(sTex,vTex+vec2(float(i),float(j))*uPx*2.0).rgb;" +
+    "vec3 d2=s2-c;float w2=0.6*exp(-dot(d2,d2)*uDen*1.6);acc+=s2*w2;ws+=w2;}}" +
+    "gl_FragColor=vec4(acc/ws,1.0);}"
+private val GL_FS_T = GL_PREC +
+    "varying vec2 vTex;uniform sampler2D sCur;uniform sampler2D sPrev;uniform vec2 uPx;uniform float uHas;" +
+    "float lum(vec3 c){return dot(c,vec3(0.299,0.587,0.114));}" +
+    "void main(){" +
+    "vec3 c=texture2D(sCur,vTex).rgb;" +
+    "if(uHas<0.5){gl_FragColor=vec4(c,1.0);return;}" +
+    "vec3 p=texture2D(sPrev,vTex).rgb;" +
+    "vec2 o=uPx*1.5;" +
+    "float a=lum(texture2D(sCur,vTex+vec2(o.x,0.0)).rgb)+lum(texture2D(sCur,vTex-vec2(o.x,0.0)).rgb)" +
+    "+lum(texture2D(sCur,vTex+vec2(0.0,o.y)).rgb)+lum(texture2D(sCur,vTex-vec2(0.0,o.y)).rgb)+lum(c)*2.0;" +
+    "float b=lum(texture2D(sPrev,vTex+vec2(o.x,0.0)).rgb)+lum(texture2D(sPrev,vTex-vec2(o.x,0.0)).rgb)" +
+    "+lum(texture2D(sPrev,vTex+vec2(0.0,o.y)).rgb)+lum(texture2D(sPrev,vTex-vec2(0.0,o.y)).rgb)+lum(p)*2.0;" +
+    "float d=abs(a-b)/6.0;" +
+    "float w=0.6*(1.0-smoothstep(0.015,0.09,d));" +
+    "gl_FragColor=vec4(mix(c,p,w),1.0);}"
+private val GL_FS_S3 = GL_PREC +
+    "varying vec2 vTex;uniform sampler2D sTex;uniform vec2 uPx;uniform float uSharp;" +
+    "void main(){" +
+    "vec3 e=texture2D(sTex,vTex).rgb;" +
+    "vec3 b=texture2D(sTex,vTex+vec2(0.0,uPx.y)).rgb;" +
+    "vec3 h=texture2D(sTex,vTex-vec2(0.0,uPx.y)).rgb;" +
+    "vec3 d=texture2D(sTex,vTex-vec2(uPx.x,0.0)).rgb;" +
+    "vec3 f=texture2D(sTex,vTex+vec2(uPx.x,0.0)).rgb;" +
+    "vec3 mn=min(min(min(d,e),min(f,b)),h);vec3 mx=max(max(max(d,e),max(f,b)),h);" +
+    "vec3 amp=sqrt(clamp(min(mn,1.0-mx)/(mx+0.0001),0.0,1.0));" +
+    "vec3 w=amp*(-1.0/mix(8.0,5.0,uSharp));" +
+    "vec3 o=((b+d+f+h)*w+e)/(4.0*w+1.0);" +
+    "float l=dot(o,vec3(0.299,0.587,0.114));" +
+    "o=mix(vec3(l),o,1.07);o=(o-0.5)*1.03+0.5;" +
+    "gl_FragColor=vec4(clamp(o,0.0,1.0),1.0);}"
+
 private class VideoGl(
     outSurface: Surface,
     private val outW: Int,
     private val outH: Int,
     private val srcW: Int,
     private val srcH: Int,
-    private val sharp: Float
+    private val scale: Float
 ) {
     private var dpy: EGLDisplay = EGL14.EGL_NO_DISPLAY
     private var ctx: EGLContext = EGL14.EGL_NO_CONTEXT
     private var surf: EGLSurface = EGL14.EGL_NO_SURFACE
-    private var prog = 0
+    private var progFast = 0
+    private var progS1 = 0
+    private var progT = 0
+    private var progS3 = 0
     private var tex = 0
     private val tm = FloatArray(16)
     private val frames = Semaphore(0)
+    private val fboTex = IntArray(3)
+    private val fbo = IntArray(3)
+    private var flip = false
+    private var hasPrev = false
+    var quality = false
     val st: SurfaceTexture
     val decSurface: Surface
     private val quad: FloatBuffer = ByteBuffer.allocateDirect(16 * 4).order(ByteOrder.nativeOrder()).asFloatBuffer().apply {
@@ -1730,31 +2320,17 @@ private class VideoGl(
         surf = EGL14.eglCreateWindowSurface(dpy, cfgs[0], outSurface, intArrayOf(EGL14.EGL_NONE), 0)
         EGL14.eglMakeCurrent(dpy, surf, surf, ctx)
 
-        val vs = "uniform mat4 uTm;attribute vec4 aPos;attribute vec2 aTex;varying vec2 vTex;" +
-            "void main(){gl_Position=aPos;vTex=(uTm*vec4(aTex,0.0,1.0)).xy;}"
-        val fs = "#extension GL_OES_EGL_image_external : require\n" +
-            "precision mediump float;varying vec2 vTex;uniform samplerExternalOES sTex;" +
-            "uniform vec2 uPx;uniform float uDen;uniform float uSharp;" +
-            "void main(){" +
-            "vec3 c=texture2D(sTex,vTex).rgb;vec3 acc=c;float ws=1.0;vec3 mean=c;" +
-            "for(int i=-1;i<=1;i++){for(int j=-1;j<=1;j++){" +
-            "if(i==0&&j==0)continue;" +
-            "vec3 s=texture2D(sTex,vTex+vec2(float(i),float(j))*uPx).rgb;" +
-            "vec3 d=s-c;float w=exp(-dot(d,d)*uDen);acc+=s*w;ws+=w;mean+=s;}}" +
-            "vec3 den=acc/ws;vec3 blur=mean/9.0;" +
-            "vec3 o=den+(den-blur)*uSharp;" +
-            "float l=dot(o,vec3(0.299,0.587,0.114));" +
-            "o=mix(vec3(l),o,1.08);o=(o-0.5)*1.04+0.5;" +
-            "gl_FragColor=vec4(clamp(o,0.0,1.0),1.0);}"
-        val v = compile(GLES20.GL_VERTEX_SHADER, vs)
-        val f = compile(GLES20.GL_FRAGMENT_SHADER, fs)
-        prog = GLES20.glCreateProgram()
-        GLES20.glAttachShader(prog, v)
-        GLES20.glAttachShader(prog, f)
-        GLES20.glLinkProgram(prog)
-        val ls = IntArray(1)
-        GLES20.glGetProgramiv(prog, GLES20.GL_LINK_STATUS, ls, 0)
-        if (ls[0] == 0) throw RuntimeException("GL программа не собралась")
+        progFast = link(GL_VS_EXT, GL_FS_FAST)
+        // сложный конвейер; если телефон его не тянет, останется быстрый вариант
+        try {
+            progS1 = link(GL_VS_EXT, GL_FS_S1)
+            progT = link(GL_VS_2D, GL_FS_T)
+            progS3 = link(GL_VS_2D, GL_FS_S3)
+            for (k in 0..2) makeFbo(k)
+            quality = true
+        } catch (t: Throwable) {
+            quality = false
+        }
 
         val t = IntArray(1)
         GLES20.glGenTextures(1, t, 0)
@@ -1786,6 +2362,39 @@ private class VideoGl(
         return s
     }
 
+    private fun link(vs: String, fs: String): Int {
+        val v = compile(GLES20.GL_VERTEX_SHADER, vs)
+        val f = compile(GLES20.GL_FRAGMENT_SHADER, fs)
+        val p = GLES20.glCreateProgram()
+        GLES20.glAttachShader(p, v)
+        GLES20.glAttachShader(p, f)
+        GLES20.glLinkProgram(p)
+        val ls = IntArray(1)
+        GLES20.glGetProgramiv(p, GLES20.GL_LINK_STATUS, ls, 0)
+        if (ls[0] == 0) throw RuntimeException("GL программа не собралась")
+        return p
+    }
+
+    private fun makeFbo(k: Int) {
+        val t = IntArray(1)
+        GLES20.glGenTextures(1, t, 0)
+        fboTex[k] = t[0]
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, t[0])
+        GLES20.glTexImage2D(GLES20.GL_TEXTURE_2D, 0, GLES20.GL_RGBA, outW, outH, 0, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, null)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+        val f = IntArray(1)
+        GLES20.glGenFramebuffers(1, f, 0)
+        fbo[k] = f[0]
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, f[0])
+        GLES20.glFramebufferTexture2D(GLES20.GL_FRAMEBUFFER, GLES20.GL_COLOR_ATTACHMENT0, GLES20.GL_TEXTURE_2D, t[0], 0)
+        val status = GLES20.glCheckFramebufferStatus(GLES20.GL_FRAMEBUFFER)
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+        if (status != GLES20.GL_FRAMEBUFFER_COMPLETE) throw RuntimeException("FBO не готов")
+    }
+
     fun awaitFrame(): Boolean {
         if (!frames.tryAcquire(3, TimeUnit.SECONDS)) return false
         st.updateTexImage()
@@ -1793,27 +2402,84 @@ private class VideoGl(
         return true
     }
 
-    fun draw(ptsNs: Long) {
-        GLES20.glViewport(0, 0, outW, outH)
-        GLES20.glUseProgram(prog)
-        val aPos = GLES20.glGetAttribLocation(prog, "aPos")
-        val aTex = GLES20.glGetAttribLocation(prog, "aTex")
+    private fun bindQuad(p: Int) {
+        val aPos = GLES20.glGetAttribLocation(p, "aPos")
+        val aTex = GLES20.glGetAttribLocation(p, "aTex")
         quad.position(0)
         GLES20.glVertexAttribPointer(aPos, 2, GLES20.GL_FLOAT, false, 16, quad)
         GLES20.glEnableVertexAttribArray(aPos)
         quad.position(2)
         GLES20.glVertexAttribPointer(aTex, 2, GLES20.GL_FLOAT, false, 16, quad)
         GLES20.glEnableVertexAttribArray(aTex)
-        GLES20.glUniformMatrix4fv(GLES20.glGetUniformLocation(prog, "uTm"), 1, false, tm, 0)
-        GLES20.glUniform2f(GLES20.glGetUniformLocation(prog, "uPx"), 1f / srcW, 1f / srcH)
-        GLES20.glUniform1f(GLES20.glGetUniformLocation(prog, "uDen"), 250f)
-        GLES20.glUniform1f(GLES20.glGetUniformLocation(prog, "uSharp"), sharp)
-        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
-        GLES20.glBindTexture(0x8D65, tex)
-        GLES20.glUniform1i(GLES20.glGetUniformLocation(prog, "sTex"), 0)
-        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+    }
+
+    private fun loc(p: Int, name: String) = GLES20.glGetUniformLocation(p, name)
+
+    fun draw(ptsNs: Long) {
+        if (!quality) drawFast() else drawQuality()
         EGLExt.eglPresentationTimeANDROID(dpy, surf, ptsNs)
         EGL14.eglSwapBuffers(dpy, surf)
+    }
+
+    private fun drawFast() {
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+        GLES20.glViewport(0, 0, outW, outH)
+        GLES20.glUseProgram(progFast)
+        bindQuad(progFast)
+        GLES20.glUniformMatrix4fv(loc(progFast, "uTm"), 1, false, tm, 0)
+        GLES20.glUniform2f(loc(progFast, "uPx"), 1f / srcW, 1f / srcH)
+        GLES20.glUniform1f(loc(progFast, "uDen"), 250f)
+        GLES20.glUniform1f(loc(progFast, "uSharp"), 0.7f + 0.5f * (scale - 1f))
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(0x8D65, tex)
+        GLES20.glUniform1i(loc(progFast, "sTex"), 0)
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+    }
+
+    private fun drawQuality() {
+        // проход 1: шумоподавление и увеличение -> fbo[0]
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, fbo[0])
+        GLES20.glViewport(0, 0, outW, outH)
+        GLES20.glUseProgram(progS1)
+        bindQuad(progS1)
+        GLES20.glUniformMatrix4fv(loc(progS1, "uTm"), 1, false, tm, 0)
+        GLES20.glUniform2f(loc(progS1, "uPx"), 1f / srcW, 1f / srcH)
+        GLES20.glUniform1f(loc(progS1, "uDen"), 250f)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(0x8D65, tex)
+        GLES20.glUniform1i(loc(progS1, "sTex"), 0)
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+
+        // проход 2: смешивание с прошлым результатом там, где нет движения
+        val cur = if (flip) 2 else 1
+        val prev = if (flip) 1 else 2
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, fbo[cur])
+        GLES20.glUseProgram(progT)
+        bindQuad(progT)
+        GLES20.glUniform2f(loc(progT, "uPx"), 1f / outW, 1f / outH)
+        GLES20.glUniform1f(loc(progT, "uHas"), if (hasPrev) 1f else 0f)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, fboTex[0])
+        GLES20.glUniform1i(loc(progT, "sCur"), 0)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE1)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, fboTex[prev])
+        GLES20.glUniform1i(loc(progT, "sPrev"), 1)
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+
+        // проход 3: умная резкость -> окно кодера
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+        GLES20.glViewport(0, 0, outW, outH)
+        GLES20.glUseProgram(progS3)
+        bindQuad(progS3)
+        GLES20.glUniform2f(loc(progS3, "uPx"), 1f / outW, 1f / outH)
+        GLES20.glUniform1f(loc(progS3, "uSharp"), (0.6f + 0.3f * (scale - 1f)).coerceAtMost(1f))
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, fboTex[cur])
+        GLES20.glUniform1i(loc(progS3, "sTex"), 0)
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+
+        flip = !flip
+        hasPrev = true
     }
 
     fun release() {
@@ -1827,5 +2493,13 @@ private class VideoGl(
             EGL14.eglTerminate(dpy)
         }
         dpy = EGL14.EGL_NO_DISPLAY
+    }
+}
+
+private data class MediaItem(val id: Long, val video: Boolean, val uri: Uri)
+
+private class SquareFrame(ctx: android.content.Context) : FrameLayout(ctx) {
+    override fun onMeasure(w: Int, h: Int) {
+        super.onMeasure(w, w)
     }
 }
