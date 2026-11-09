@@ -25,8 +25,12 @@ import android.view.Choreographer
 import android.view.GestureDetector
 import android.view.MotionEvent
 import android.view.ScaleGestureDetector
+import android.view.Gravity
 import android.view.View
+import android.util.TypedValue
+import android.widget.FrameLayout
 import android.widget.ImageView
+import android.widget.LinearLayout
 import android.widget.PopupMenu
 import android.widget.ProgressBar
 import android.view.ViewGroup
@@ -75,6 +79,7 @@ import java.util.Date
 import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.exp
+import kotlin.math.floor
 import kotlin.math.ln
 import kotlin.math.pow
 
@@ -124,6 +129,12 @@ class MainActivity : AppCompatActivity() {
     private var lastHw = 0f
     private val virtualMax = 100f    // дальше аппаратного приближаем программно
     private var lastHint = 0L
+    private var focusLocked = false
+    private var stabOn = true
+    private var isRecording = false
+    private val photoLock = Any()
+    private lateinit var focusBtn: TextView
+    private lateinit var stabBtn: TextView
     private var aiOn = true
     private var aiBusy = false
     private var highZoom = false
@@ -258,6 +269,7 @@ class MainActivity : AppCompatActivity() {
         nightBtn.setOnClickListener { setMode(if (mode == 1) 0 else 1) }
         dayBtn.setOnClickListener { setMode(if (mode == 2) 0 else 2) }
         aiBtn.setOnClickListener { showEnhanceDialog() }
+        addExtraButtons()
         updateModeUi()
 
         recBtn.setOnClickListener { toggleRecord() }
@@ -292,7 +304,14 @@ class MainActivity : AppCompatActivity() {
                 val lx = previewView.pivotX + (e.x - previewView.pivotX) / sc
                 val ly = previewView.pivotY + (e.y - previewView.pivotY) / sc
                 val pt = previewView.meteringPointFactory.createPoint(lx, ly)
-                camera?.cameraControl?.startFocusAndMetering(FocusMeteringAction.Builder(pt).build())
+                if (focusLocked) {
+                    // фокус держится на выбранном предмете, пока не выключишь кнопку 🎯 (яркость не трогаем)
+                    camera?.cameraControl?.startFocusAndMetering(
+                        FocusMeteringAction.Builder(pt, FocusMeteringAction.FLAG_AF).disableAutoCancel().build()
+                    )
+                } else {
+                    camera?.cameraControl?.startFocusAndMetering(FocusMeteringAction.Builder(pt).build())
+                }
                 showFocusRing(e.x, e.y)
                 return true
             }
@@ -423,6 +442,7 @@ class MainActivity : AppCompatActivity() {
             zoomLive?.removeObserver(zoomObs)
             minZ = 1f; maxZ = 1f; targetZ = 1f; curZ = 1f; lastApplied = 0f
             hwMaxZ = 1f; lastHw = 0f
+            focusLocked = false
             previewView.scaleX = 1f; previewView.scaleY = 1f
             camera = p.bindToLifecycle(this, selector, preview, vc, ic)
             videoCapture = vc
@@ -431,6 +451,7 @@ class MainActivity : AppCompatActivity() {
             zoomLive!!.observe(this, zoomObs)
             zoomSeek.progress = 0
             updateZoomChips()
+            updateModeUi()
             applyMode()
         } catch (e: Exception) {
             if (fpsIndex == 1) {
@@ -471,14 +492,20 @@ class MainActivity : AppCompatActivity() {
         if (hasPerm(Manifest.permission.RECORD_AUDIO)) pending = pending.withAudioEnabled()
         recording = pending.start(ContextCompat.getMainExecutor(this)) { ev ->
             when (ev) {
-                is VideoRecordEvent.Start -> setRecUi(true)
+                is VideoRecordEvent.Start -> {
+                    isRecording = true
+                    setRecUi(true)
+                    applyMode()
+                }
                 is VideoRecordEvent.Status -> {
                     val s = ev.recordingStats.recordedDurationNanos / 1_000_000_000L
                     timerText.text = String.format(Locale.US, "● %02d:%02d", s / 60, s % 60)
                 }
                 is VideoRecordEvent.Finalize -> {
                     recording = null
+                    isRecording = false
                     setRecUi(false)
+                    applyMode()
                     if (ev.hasError()) {
                         Toast.makeText(this, "Ошибка записи: " + ev.error, Toast.LENGTH_LONG).show()
                     } else {
@@ -493,6 +520,7 @@ class MainActivity : AppCompatActivity() {
     private fun takePhoto() {
         val ic = imageCapture ?: return
         val shotZoom = curZ
+        val shotMode = mode
         val hwNow = curZ.coerceIn(minZ, maxOf(minZ, hwMaxZ))
         val extraZ = if (hwNow > 0f) curZ / hwNow else 1f
         val name = "ZoomCam_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
@@ -511,20 +539,21 @@ class MainActivity : AppCompatActivity() {
             override fun onImageSaved(r: ImageCapture.OutputFileResults) {
                 Toast.makeText(this@MainActivity, "Фото сохранено в галерею", Toast.LENGTH_SHORT).show()
                 val u = r.savedUri
-                if (u != null && extraZ > 1.02f) {
-                    // зум выше аппаратного: вырезаем центр кадра и растягиваем до полного размера
+                if (u != null) {
+                    // убираем цветной шум и (если зум выше аппаратного) приближаем фото
                     Thread {
-                        val ok = try { cropUpscale(u, extraZ) } catch (t: Throwable) { false }
+                        val ok = synchronized(photoLock) {
+                            try { processPhoto(u, extraZ, shotMode == 1) } catch (t: Throwable) { false }
+                        }
                         runOnUiThread {
-                            if (!ok) {
-                                Toast.makeText(this@MainActivity, "Не удалось приблизить фото", Toast.LENGTH_LONG).show()
-                            } else if (aiOn) {
-                                enhanceAsync(u, shotZoom, name)
+                            if (ok) {
+                                Toast.makeText(this@MainActivity, "Фото очищено от шума", Toast.LENGTH_SHORT).show()
+                            } else {
+                                Toast.makeText(this@MainActivity, "Не удалось очистить фото, оставил как есть", Toast.LENGTH_LONG).show()
                             }
+                            if ((ok || extraZ <= 1.02f) && aiOn) enhanceAsync(u, shotZoom, name)
                         }
                     }.start()
-                } else if (aiOn && u != null) {
-                    enhanceAsync(u, shotZoom, name)
                 }
             }
             override fun onError(e: ImageCaptureException) {
@@ -533,8 +562,8 @@ class MainActivity : AppCompatActivity() {
         })
     }
 
-    // Программный зум для фото: берём центр снимка и растягиваем обратно до исходного размера
-    private fun cropUpscale(uri: Uri, extra: Float): Boolean {
+    // Обработка фото после съёмки: чистим цветной шум, а при зуме выше аппаратного берём центр кадра и растягиваем
+    private fun processPhoto(uri: Uri, extra: Float, strong: Boolean): Boolean {
         val bytes = contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: return false
         val bo = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bo)
@@ -549,28 +578,245 @@ class MainActivity : AppCompatActivity() {
             ExifInterface.ORIENTATION_ROTATE_270 -> 270f
             else -> 0f
         }
-        val cw = (w0 / extra).toInt().coerceIn(16, w0)
-        val ch = (h0 / extra).toInt().coerceIn(16, h0)
-        val left = (w0 - cw) / 2
-        val top = (h0 - ch) / 2
-        @Suppress("DEPRECATION")
-        val dec = BitmapRegionDecoder.newInstance(bytes, 0, bytes.size, false) ?: return false
-        var crop = dec.decodeRegion(Rect(left, top, left + cw, top + ch), null)
-        dec.recycle()
-        if (crop == null) return false
+        val crop = extra > 1.02f
+        var bmp: Bitmap
+        if (crop) {
+            val cw = (w0 / extra).toInt().coerceIn(16, w0)
+            val ch = (h0 / extra).toInt().coerceIn(16, h0)
+            val left = (w0 - cw) / 2
+            val top = (h0 - ch) / 2
+            @Suppress("DEPRECATION")
+            val dec = BitmapRegionDecoder.newInstance(bytes, 0, bytes.size, false) ?: return false
+            val part = dec.decodeRegion(Rect(left, top, left + cw, top + ch), null)
+            dec.recycle()
+            if (part == null) return false
+            bmp = if (part.isMutable) part else (part.copy(Bitmap.Config.ARGB_8888, true) ?: return false)
+        } else {
+            val o = BitmapFactory.Options().apply {
+                inMutable = true
+                inPreferredConfig = Bitmap.Config.ARGB_8888
+            }
+            bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, o) ?: return false
+        }
+        // шум убираем на родном разрешении, пока картинка ещё не растянута
+        cleanNoise(bmp, strong)
         if (deg != 0f) {
             val m = Matrix().apply { postRotate(deg) }
-            crop = Bitmap.createBitmap(crop, 0, 0, crop.width, crop.height, m, true)
+            val rot = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, m, true)
+            if (rot !== bmp) bmp.recycle()
+            bmp = rot
         }
-        val swap = deg == 90f || deg == 270f
-        val outW = if (swap) h0 else w0
-        val outH = if (swap) w0 else h0
-        val big = Bitmap.createScaledBitmap(crop, outW, outH, true)
+        if (crop) {
+            val swap = deg == 90f || deg == 270f
+            val outW = if (swap) h0 else w0
+            val outH = if (swap) w0 else h0
+            val big = Bitmap.createScaledBitmap(bmp, outW, outH, true)
+            if (big !== bmp) bmp.recycle()
+            bmp = big
+        }
         val bos = ByteArrayOutputStream()
-        big.compress(Bitmap.CompressFormat.JPEG, 95, bos)
+        bmp.compress(Bitmap.CompressFormat.JPEG, 97, bos)
         val out = contentResolver.openOutputStream(uri, "wt") ?: return false
         out.use { it.write(bos.toByteArray()) }
         return true
+    }
+
+    private fun halve(b: Bitmap): Bitmap =
+        Bitmap.createScaledBitmap(b, maxOf(1, b.width / 2), maxOf(1, b.height / 2), true)
+
+    // Шумоподавление: цвет берём из сильно размытой копии (убирает цветные точки), яркость слегка сглаживаем в тёмных местах
+    private fun cleanNoise(bmp: Bitmap, strong: Boolean) {
+        val w = bmp.width
+        val h = bmp.height
+        if (w < 16 || h < 16) return
+        val half = halve(bmp)
+        val q = halve(half)
+        val e = halve(q)
+        val cs = if (strong) e else q
+        val cw = cs.width
+        val ch = cs.height
+        val cp = IntArray(cw * ch)
+        cs.getPixels(cp, 0, cw, 0, 0, cw, ch)
+        val cb = FloatArray(cw * ch)
+        val cr = FloatArray(cw * ch)
+        for (i in cp.indices) {
+            val p = cp[i]
+            val r = (p shr 16) and 255
+            val g = (p shr 8) and 255
+            val b = p and 255
+            val y = 0.299f * r + 0.587f * g + 0.114f * b
+            cb[i] = (b - y) * 0.564f
+            cr[i] = (r - y) * 0.713f
+        }
+        val hw = half.width
+        val hh = half.height
+        val hp = IntArray(hw * hh)
+        half.getPixels(hp, 0, hw, 0, 0, hw, hh)
+        val yl = FloatArray(hw * hh)
+        for (i in hp.indices) {
+            val p = hp[i]
+            yl[i] = 0.299f * ((p shr 16) and 255) + 0.587f * ((p shr 8) and 255) + 0.114f * (p and 255)
+        }
+        half.recycle(); q.recycle(); e.recycle()
+
+        val cx0 = IntArray(w); val cx1 = IntArray(w); val cxt = FloatArray(w)
+        val hx0 = IntArray(w); val hx1 = IntArray(w); val hxt = FloatArray(w)
+        for (x in 0 until w) {
+            val fc = (x + 0.5f) * cw / w - 0.5f
+            val ci = floor(fc).toInt()
+            cx0[x] = ci.coerceIn(0, cw - 1); cx1[x] = (ci + 1).coerceIn(0, cw - 1); cxt[x] = fc - ci
+            val fh = (x + 0.5f) * hw / w - 0.5f
+            val hi = floor(fh).toInt()
+            hx0[x] = hi.coerceIn(0, hw - 1); hx1[x] = (hi + 1).coerceIn(0, hw - 1); hxt[x] = fh - hi
+        }
+        val base = if (strong) 0.20f else 0.08f
+        val gain = if (strong) 0.55f else 0.35f
+        val rowsPer = 32
+        val buf = IntArray(w * rowsPer)
+        var y0 = 0
+        while (y0 < h) {
+            val rows = minOf(rowsPer, h - y0)
+            bmp.getPixels(buf, 0, w, 0, y0, w, rows)
+            for (ry in 0 until rows) {
+                val y = y0 + ry
+                val fcy = (y + 0.5f) * ch / h - 0.5f
+                val cyi = floor(fcy).toInt()
+                val cyt = fcy - cyi
+                val cy0 = cyi.coerceIn(0, ch - 1) * cw
+                val cy1 = (cyi + 1).coerceIn(0, ch - 1) * cw
+                val fhy = (y + 0.5f) * hh / h - 0.5f
+                val hyi = floor(fhy).toInt()
+                val hyt = fhy - hyi
+                val hy0 = hyi.coerceIn(0, hh - 1) * hw
+                val hy1 = (hyi + 1).coerceIn(0, hh - 1) * hw
+                for (x in 0 until w) {
+                    val idx = ry * w + x
+                    val p = buf[idx]
+                    val r = (p shr 16) and 255
+                    val g = (p shr 8) and 255
+                    val b = p and 255
+                    val yy = 0.299f * r + 0.587f * g + 0.114f * b
+                    val a = cxt[x]
+                    val i00 = cy0 + cx0[x]; val i01 = cy0 + cx1[x]
+                    val i10 = cy1 + cx0[x]; val i11 = cy1 + cx1[x]
+                    val cbv = (cb[i00] * (1 - a) + cb[i01] * a) * (1 - cyt) + (cb[i10] * (1 - a) + cb[i11] * a) * cyt
+                    val crv = (cr[i00] * (1 - a) + cr[i01] * a) * (1 - cyt) + (cr[i10] * (1 - a) + cr[i11] * a) * cyt
+                    val ah = hxt[x]
+                    val j00 = hy0 + hx0[x]; val j01 = hy0 + hx1[x]
+                    val j10 = hy1 + hx0[x]; val j11 = hy1 + hx1[x]
+                    val ylow = (yl[j00] * (1 - ah) + yl[j01] * ah) * (1 - hyt) + (yl[j10] * (1 - ah) + yl[j11] * ah) * hyt
+                    val dark = 1f - minOf(yy, 160f) / 160f
+                    val wl = base + gain * dark
+                    val ny = yy + (ylow - yy) * wl
+                    var nr = ny + 1.403f * crv
+                    var nb = ny + 1.773f * cbv
+                    var ng = (ny - 0.299f * nr - 0.114f * nb) / 0.587f
+                    if (nr < 0f) nr = 0f else if (nr > 255f) nr = 255f
+                    if (ng < 0f) ng = 0f else if (ng > 255f) ng = 255f
+                    if (nb < 0f) nb = 0f else if (nb > 255f) nb = 255f
+                    buf[idx] = (0xFF shl 24) or (nr.toInt() shl 16) or (ng.toInt() shl 8) or nb.toInt()
+                }
+            }
+            bmp.setPixels(buf, 0, w, 0, y0, w, rows)
+            y0 += rows
+        }
+    }
+
+    // ---------- Кнопки: фиксация фокуса и стабилизация ----------
+    // 0 = нет, 1 = оптическая, 2 = электронная
+    private fun stabKind(cam: Camera): Int {
+        return try {
+            val c2 = Camera2CameraInfo.from(cam.cameraInfo)
+            val ois = c2.getCameraCharacteristic(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION)
+            val eis = c2.getCameraCharacteristic(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES)
+            if (ois != null && ois.contains(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON)) 1
+            else if (eis != null && eis.contains(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON)) 2
+            else 0
+        } catch (e: Exception) {
+            0
+        }
+    }
+
+    private fun makeSideBtn(label: String): TextView {
+        val t = TextView(this)
+        t.text = label
+        t.setTextSize(TypedValue.COMPLEX_UNIT_PX, aiBtn.textSize)
+        t.gravity = aiBtn.gravity
+        t.setTextColor(aiBtn.textColors)
+        t.typeface = aiBtn.typeface
+        t.setPadding(aiBtn.paddingLeft, aiBtn.paddingTop, aiBtn.paddingRight, aiBtn.paddingBottom)
+        aiBtn.background?.constantState?.newDrawable()?.let { t.background = it.mutate() }
+        return t
+    }
+
+    private fun addExtraButtons() {
+        focusBtn = makeSideBtn("🎯")
+        stabBtn = makeSideBtn("🛡")
+        val parent = aiBtn.parent as? ViewGroup
+        if (parent is LinearLayout) {
+            val idx = parent.indexOfChild(aiBtn)
+            fun copyLp(): ViewGroup.LayoutParams {
+                val l = aiBtn.layoutParams
+                return try {
+                    l.javaClass.getConstructor(l.javaClass).newInstance(l) as ViewGroup.LayoutParams
+                } catch (e: Throwable) {
+                    ViewGroup.MarginLayoutParams(l)
+                }
+            }
+            parent.addView(focusBtn, idx + 1, copyLp())
+            parent.addView(stabBtn, idx + 2, copyLp())
+        } else {
+            // запасной вариант: отдельная колонка слева по центру экрана
+            val d = resources.displayMetrics.density
+            val col = LinearLayout(this)
+            col.orientation = LinearLayout.VERTICAL
+            val size = (50 * d).toInt()
+            val gap = (10 * d).toInt()
+            col.addView(focusBtn, LinearLayout.LayoutParams(size, size).apply { bottomMargin = gap })
+            col.addView(stabBtn, LinearLayout.LayoutParams(size, size))
+            val flp = FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.START or Gravity.CENTER_VERTICAL
+            )
+            flp.leftMargin = (12 * d).toInt()
+            findViewById<ViewGroup>(android.R.id.content).addView(col, flp)
+        }
+        focusBtn.setOnClickListener { toggleFocusLock() }
+        stabBtn.setOnClickListener { toggleStab() }
+        pressFx(focusBtn)
+        pressFx(stabBtn)
+    }
+
+    private fun toggleFocusLock() {
+        val cam = camera ?: return
+        focusLocked = !focusLocked
+        if (focusLocked) {
+            val pt = previewView.meteringPointFactory.createPoint(previewView.width / 2f, previewView.height / 2f)
+            cam.cameraControl.startFocusAndMetering(
+                FocusMeteringAction.Builder(pt, FocusMeteringAction.FLAG_AF).disableAutoCancel().build()
+            )
+            showFocusRing(previewView.width / 2f, previewView.height / 2f)
+            Toast.makeText(this, "Фокус зафиксирован. Тапни по предмету, чтобы навести на него", Toast.LENGTH_LONG).show()
+        } else {
+            cam.cameraControl.cancelFocusAndMetering()
+            Toast.makeText(this, "Автофокус включён", Toast.LENGTH_SHORT).show()
+        }
+        updateModeUi()
+        applyMode()
+    }
+
+    private fun toggleStab() {
+        val cam = camera ?: return
+        val kind = stabKind(cam)
+        if (kind == 0) {
+            Toast.makeText(this, "Этот телефон не поддерживает стабилизацию камеры", Toast.LENGTH_LONG).show()
+            return
+        }
+        stabOn = !stabOn
+        updateModeUi()
+        applyMode()
+        val how = if (kind == 1) "оптическая" else "электронная"
+        Toast.makeText(this, if (stabOn) "Стабилизация включена ($how)" else "Стабилизация выключена", Toast.LENGTH_SHORT).show()
     }
 
     // ---------- ИИ-улучшение фото при зуме ----------
@@ -868,6 +1114,10 @@ class MainActivity : AppCompatActivity() {
         setSel(nightBtn, mode == 1)
         setSel(dayBtn, mode == 2)
         setSel(aiBtn, aiOn)
+        if (this::focusBtn.isInitialized) {
+            setSel(focusBtn, focusLocked)
+            setSel(stabBtn, stabOn)
+        }
     }
 
     private fun updatePills() {
@@ -933,7 +1183,7 @@ class MainActivity : AppCompatActivity() {
             val edgeModes = c2info.getCameraCharacteristic(CameraCharacteristics.EDGE_AVAILABLE_EDGE_MODES)
             val b = CaptureRequestOptions.Builder()
             // сглаживание при сильном зуме: сильное шумоподавление и без излишней резкости (она подчёркивает «квадраты»)
-            if (aiOn && fpsIndex == 0) {
+            if (fpsIndex == 0) {
                 if (nrModes != null && nrModes.contains(CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY)) {
                     b.setCaptureRequestOption(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY)
                 }
@@ -952,6 +1202,26 @@ class MainActivity : AppCompatActivity() {
             }
             if (mode == 1 && nrModes != null && nrModes.contains(CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY)) {
                 b.setCaptureRequestOption(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY)
+            }
+            // плавный автофокус при записи видео: без «наезда» размытия, когда двигаешь телефон
+            if (isRecording && !focusLocked) {
+                val afModes = c2info.getCameraCharacteristic(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES)
+                if (afModes != null && afModes.contains(CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)) {
+                    b.setCaptureRequestOption(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
+                }
+            }
+            // стабилизация: оптическая, а если её нет, то электронная
+            val kind = stabKind(cam)
+            if (kind == 1) {
+                b.setCaptureRequestOption(
+                    CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
+                    if (stabOn) CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON else CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_OFF
+                )
+            } else if (kind == 2) {
+                b.setCaptureRequestOption(
+                    CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
+                    if (stabOn) CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON else CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_OFF
+                )
             }
             Camera2CameraControl.from(cam.cameraControl).setCaptureRequestOptions(b.build())
         } catch (e: Exception) {
