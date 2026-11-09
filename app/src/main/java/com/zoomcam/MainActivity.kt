@@ -20,6 +20,8 @@ import android.util.LruCache
 import android.view.ViewOutlineProvider
 import android.widget.BaseAdapter
 import android.widget.GridView
+import android.widget.MediaController
+import android.widget.VideoView
 import androidx.activity.OnBackPressedCallback
 import java.util.concurrent.Executors
 import android.graphics.SurfaceTexture
@@ -147,6 +149,8 @@ class MainActivity : AppCompatActivity() {
     private var viewerImg: ImageView? = null
     private var viewerPlay: View? = null
     private var viewerCount: TextView? = null
+    private var viewerVideo: VideoView? = null
+    private var viewerRow: View? = null
     private var viewerIndex = 0
     private var viewerSeq = 0
     private var pendingGallery = false
@@ -1226,6 +1230,9 @@ class MainActivity : AppCompatActivity() {
         viewerImg = null
         viewerPlay = null
         viewerCount = null
+        try { viewerVideo?.stopPlayback() } catch (t: Throwable) {}
+        viewerVideo = null
+        viewerRow = null
         viewerSeq++
         backCb.isEnabled = false
         r.animate().alpha(0f).setDuration(180).withEndAction { (r.parent as? ViewGroup)?.removeView(r) }.start()
@@ -1238,8 +1245,40 @@ class MainActivity : AppCompatActivity() {
         viewerImg = null
         viewerPlay = null
         viewerCount = null
+        try { viewerVideo?.stopPlayback() } catch (t: Throwable) {}
+        viewerVideo = null
+        viewerRow = null
         viewerSeq++
         v.animate().alpha(0f).setDuration(150).withEndAction { (v.parent as? ViewGroup)?.removeView(v) }.start()
+    }
+
+    // видео смотрим прямо в галерее камеры, без других приложений
+    private fun stopViewerVideo() {
+        val vid = viewerVideo ?: return
+        try { vid.stopPlayback() } catch (t: Throwable) {}
+        vid.visibility = View.GONE
+        viewerRow?.visibility = View.VISIBLE
+        val m = galleryItems.getOrNull(viewerIndex)
+        viewerPlay?.visibility = if (m != null && m.video) View.VISIBLE else View.GONE
+    }
+
+    private fun playViewerVideo(m: MediaItem) {
+        val vid = viewerVideo ?: return
+        if (vid.visibility == View.VISIBLE) return
+        viewerPlay?.visibility = View.GONE
+        viewerRow?.visibility = View.GONE
+        vid.visibility = View.VISIBLE
+        vid.setOnPreparedListener { mp ->
+            mp.isLooping = false
+            vid.start()
+        }
+        vid.setOnCompletionListener { stopViewerVideo() }
+        vid.setOnErrorListener { _, _, _ ->
+            stopViewerVideo()
+            Toast.makeText(this, "Не получилось воспроизвести это видео", Toast.LENGTH_SHORT).show()
+            true
+        }
+        vid.setVideoURI(m.uri)
     }
 
     private fun openExternal(m: MediaItem) {
@@ -1263,6 +1302,12 @@ class MainActivity : AppCompatActivity() {
         val img = ImageView(this)
         img.scaleType = ImageView.ScaleType.FIT_CENTER
         v.addView(img, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        val vid = VideoView(this)
+        vid.visibility = View.GONE
+        v.addView(vid, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT, Gravity.CENTER))
+        val mc = MediaController(this)
+        mc.setAnchorView(vid)
+        vid.setMediaController(mc)
         val play = TextView(this)
         play.text = "▶"
         play.textSize = 30f
@@ -1288,15 +1333,10 @@ class MainActivity : AppCompatActivity() {
         count.setTextColor(0xB3FFFFFF.toInt())
         row.addView(count, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         val enh = makeChip("✨ Улучшить")
-        val opn = makeChip("Открыть")
         row.addView(enh)
-        val olp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
-        olp.leftMargin = dpx(8f)
-        row.addView(opn, olp)
         v.addView(row, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM))
 
         back.setOnClickListener { closeViewer() }
-        opn.setOnClickListener { galleryItems.getOrNull(viewerIndex)?.let { openExternal(it) } }
         enh.setOnClickListener {
             val m = galleryItems.getOrNull(viewerIndex) ?: return@setOnClickListener
             if (aiBusy) {
@@ -1317,7 +1357,7 @@ class MainActivity : AppCompatActivity() {
             }
             override fun onSingleTapUp(e: MotionEvent): Boolean {
                 val m = galleryItems.getOrNull(viewerIndex)
-                if (m != null && m.video) openExternal(m)
+                if (m != null && m.video) playViewerVideo(m)
                 return true
             }
         })
@@ -1335,6 +1375,8 @@ class MainActivity : AppCompatActivity() {
         viewerImg = img
         viewerPlay = play
         viewerCount = count
+        viewerVideo = vid
+        viewerRow = row
         v.alpha = 0f
         v.animate().alpha(1f).setDuration(160).start()
         showViewerItem(index, 0)
@@ -1344,6 +1386,7 @@ class MainActivity : AppCompatActivity() {
         val items = galleryItems
         if (i < 0 || i >= items.size) return
         val img = viewerImg ?: return
+        stopViewerVideo()
         viewerIndex = i
         val seq = ++viewerSeq
         val m = items[i]
@@ -2250,11 +2293,11 @@ private val GL_FS_S1 = "#extension GL_OES_EGL_image_external : require\n" + GL_P
     "vec3 d=s-c;float w=exp(-dot(d,d)*uDen);acc+=s*w;ws+=w;" +
     "vec3 s2=texture2D(sTex,vTex+o*uPx*2.0).rgb;" +
     "vec3 d2=s2-c;float w2=0.6*exp(-dot(d2,d2)*uDen*1.6);acc+=s2*w2;ws+=w2;" +
-    "wide+=texture2D(sTex,vTex+o*uPx*3.0).rgb;}}" +
+    "wide+=texture2D(sTex,vTex+o*uPx*4.0).rgb;}}" +
     "vec3 den=acc/ws;wide/=9.0;" +
     "vec3 k=vec3(0.299,0.587,0.114);" +
     "float y=dot(den,k);" +
-    "vec3 chroma=mix(den-vec3(y),wide-vec3(dot(wide,k)),0.75);" +
+    "vec3 chroma=mix(den-vec3(y),wide-vec3(dot(wide,k)),0.9);" +
     "gl_FragColor=vec4(clamp(vec3(y)+chroma,0.0,1.0),1.0);}"
 private val GL_FS_T = GL_PREC +
     "varying vec2 vTex;uniform sampler2D sCur;uniform sampler2D sPrev;uniform vec2 uPx;uniform float uHas;" +
@@ -2269,8 +2312,12 @@ private val GL_FS_T = GL_PREC +
     "float b=lum(texture2D(sPrev,vTex+vec2(o.x,0.0)).rgb)+lum(texture2D(sPrev,vTex-vec2(o.x,0.0)).rgb)" +
     "+lum(texture2D(sPrev,vTex+vec2(0.0,o.y)).rgb)+lum(texture2D(sPrev,vTex-vec2(0.0,o.y)).rgb)+lum(p)*2.0;" +
     "float d=abs(a-b)/6.0;" +
-    "float w=0.6*(1.0-smoothstep(0.015,0.09,d));" +
-    "gl_FragColor=vec4(mix(c,p,w),1.0);}"
+    "float wy=0.8*(1.0-smoothstep(0.02,0.1,d));" +
+    "float wc=0.92*(1.0-smoothstep(0.05,0.2,d));" +
+    "float lc=lum(c);float lp=lum(p);" +
+    "float y=mix(lc,lp,wy);" +
+    "vec3 ch=mix(c-vec3(lc),p-vec3(lp),wc);" +
+    "gl_FragColor=vec4(clamp(vec3(y)+ch,0.0,1.0),1.0);}"
 private val GL_FS_S3 = GL_PREC +
     "varying vec2 vTex;uniform sampler2D sTex;uniform vec2 uPx;uniform float uSharp;" +
     "void main(){" +
@@ -2456,7 +2503,7 @@ private class VideoGl(
         bindQuad(progS1)
         GLES20.glUniformMatrix4fv(loc(progS1, "uTm"), 1, false, tm, 0)
         GLES20.glUniform2f(loc(progS1, "uPx"), 1f / srcW, 1f / srcH)
-        GLES20.glUniform1f(loc(progS1, "uDen"), 170f)
+        GLES20.glUniform1f(loc(progS1, "uDen"), 140f)
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(0x8D65, tex)
         GLES20.glUniform1i(loc(progS1, "sTex"), 0)
@@ -2484,7 +2531,7 @@ private class VideoGl(
         GLES20.glUseProgram(progS3)
         bindQuad(progS3)
         GLES20.glUniform2f(loc(progS3, "uPx"), 1f / outW, 1f / outH)
-        GLES20.glUniform1f(loc(progS3, "uSharp"), (0.8f + 0.2f * (scale - 1f)).coerceAtMost(1f))
+        GLES20.glUniform1f(loc(progS3, "uSharp"), (0.7f + 0.2f * (scale - 1f)).coerceAtMost(1f))
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, fboTex[cur])
         GLES20.glUniform1i(loc(progS3, "sTex"), 0)
