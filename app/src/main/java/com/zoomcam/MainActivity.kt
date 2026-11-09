@@ -11,6 +11,26 @@ import android.graphics.Rect
 import android.graphics.Matrix
 import android.media.ExifInterface
 import android.net.Uri
+import android.graphics.SurfaceTexture
+import android.media.MediaCodec
+import android.media.MediaCodecInfo
+import android.media.MediaExtractor
+import android.media.MediaFormat
+import android.media.MediaMetadataRetriever
+import android.media.MediaMuxer
+import android.opengl.EGL14
+import android.opengl.EGLConfig
+import android.opengl.EGLContext
+import android.opengl.EGLDisplay
+import android.opengl.EGLExt
+import android.opengl.EGLSurface
+import android.opengl.GLES20
+import android.os.Build
+import android.os.SystemClock
+import android.view.Surface
+import java.nio.FloatBuffer
+import java.util.concurrent.Semaphore
+import java.util.concurrent.TimeUnit
 import android.animation.ValueAnimator
 import android.os.Bundle
 import android.os.Handler
@@ -25,8 +45,12 @@ import android.view.Choreographer
 import android.view.GestureDetector
 import android.view.MotionEvent
 import android.view.ScaleGestureDetector
+import android.view.Gravity
 import android.view.View
+import android.util.TypedValue
+import android.widget.FrameLayout
 import android.widget.ImageView
+import android.widget.LinearLayout
 import android.widget.PopupMenu
 import android.widget.ProgressBar
 import android.view.ViewGroup
@@ -75,6 +99,7 @@ import java.util.Date
 import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.exp
+import kotlin.math.floor
 import kotlin.math.ln
 import kotlin.math.pow
 
@@ -99,7 +124,7 @@ class MainActivity : AppCompatActivity() {
     private var dlgStatus: TextView? = null
     private var dlgPreview: ImageView? = null
     private var dlgPick: TextView? = null
-    private val pickPhoto = registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+    private val pickPhoto = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) enhancePicked(uri)
     }
     private val qualityShort = listOf("480p", "720p", "1080p", "4K")
@@ -124,6 +149,12 @@ class MainActivity : AppCompatActivity() {
     private var lastHw = 0f
     private val virtualMax = 100f    // дальше аппаратного приближаем программно
     private var lastHint = 0L
+    private var focusLocked = false
+    private var stabOn = true
+    private var isRecording = false
+    private val photoLock = Any()
+    private lateinit var focusBtn: TextView
+    private lateinit var stabBtn: TextView
     private var aiOn = true
     private var aiBusy = false
     private var highZoom = false
@@ -258,6 +289,7 @@ class MainActivity : AppCompatActivity() {
         nightBtn.setOnClickListener { setMode(if (mode == 1) 0 else 1) }
         dayBtn.setOnClickListener { setMode(if (mode == 2) 0 else 2) }
         aiBtn.setOnClickListener { showEnhanceDialog() }
+        addExtraButtons()
         updateModeUi()
 
         recBtn.setOnClickListener { toggleRecord() }
@@ -292,7 +324,14 @@ class MainActivity : AppCompatActivity() {
                 val lx = previewView.pivotX + (e.x - previewView.pivotX) / sc
                 val ly = previewView.pivotY + (e.y - previewView.pivotY) / sc
                 val pt = previewView.meteringPointFactory.createPoint(lx, ly)
-                camera?.cameraControl?.startFocusAndMetering(FocusMeteringAction.Builder(pt).build())
+                if (focusLocked) {
+                    // фокус держится на выбранном предмете, пока не выключишь кнопку 🎯 (яркость не трогаем)
+                    camera?.cameraControl?.startFocusAndMetering(
+                        FocusMeteringAction.Builder(pt, FocusMeteringAction.FLAG_AF).disableAutoCancel().build()
+                    )
+                } else {
+                    camera?.cameraControl?.startFocusAndMetering(FocusMeteringAction.Builder(pt).build())
+                }
                 showFocusRing(e.x, e.y)
                 return true
             }
@@ -423,6 +462,7 @@ class MainActivity : AppCompatActivity() {
             zoomLive?.removeObserver(zoomObs)
             minZ = 1f; maxZ = 1f; targetZ = 1f; curZ = 1f; lastApplied = 0f
             hwMaxZ = 1f; lastHw = 0f
+            focusLocked = false
             previewView.scaleX = 1f; previewView.scaleY = 1f
             camera = p.bindToLifecycle(this, selector, preview, vc, ic)
             videoCapture = vc
@@ -431,6 +471,7 @@ class MainActivity : AppCompatActivity() {
             zoomLive!!.observe(this, zoomObs)
             zoomSeek.progress = 0
             updateZoomChips()
+            updateModeUi()
             applyMode()
         } catch (e: Exception) {
             if (fpsIndex == 1) {
@@ -471,14 +512,20 @@ class MainActivity : AppCompatActivity() {
         if (hasPerm(Manifest.permission.RECORD_AUDIO)) pending = pending.withAudioEnabled()
         recording = pending.start(ContextCompat.getMainExecutor(this)) { ev ->
             when (ev) {
-                is VideoRecordEvent.Start -> setRecUi(true)
+                is VideoRecordEvent.Start -> {
+                    isRecording = true
+                    setRecUi(true)
+                    applyMode()
+                }
                 is VideoRecordEvent.Status -> {
                     val s = ev.recordingStats.recordedDurationNanos / 1_000_000_000L
                     timerText.text = String.format(Locale.US, "● %02d:%02d", s / 60, s % 60)
                 }
                 is VideoRecordEvent.Finalize -> {
                     recording = null
+                    isRecording = false
                     setRecUi(false)
+                    applyMode()
                     if (ev.hasError()) {
                         Toast.makeText(this, "Ошибка записи: " + ev.error, Toast.LENGTH_LONG).show()
                     } else {
@@ -493,6 +540,7 @@ class MainActivity : AppCompatActivity() {
     private fun takePhoto() {
         val ic = imageCapture ?: return
         val shotZoom = curZ
+        val shotMode = mode
         val hwNow = curZ.coerceIn(minZ, maxOf(minZ, hwMaxZ))
         val extraZ = if (hwNow > 0f) curZ / hwNow else 1f
         val name = "ZoomCam_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
@@ -511,20 +559,21 @@ class MainActivity : AppCompatActivity() {
             override fun onImageSaved(r: ImageCapture.OutputFileResults) {
                 Toast.makeText(this@MainActivity, "Фото сохранено в галерею", Toast.LENGTH_SHORT).show()
                 val u = r.savedUri
-                if (u != null && extraZ > 1.02f) {
-                    // зум выше аппаратного: вырезаем центр кадра и растягиваем до полного размера
+                if (u != null) {
+                    // убираем цветной шум и (если зум выше аппаратного) приближаем фото
                     Thread {
-                        val ok = try { cropUpscale(u, extraZ) } catch (t: Throwable) { false }
+                        val ok = synchronized(photoLock) {
+                            try { processPhoto(u, extraZ, shotMode == 1) } catch (t: Throwable) { false }
+                        }
                         runOnUiThread {
-                            if (!ok) {
-                                Toast.makeText(this@MainActivity, "Не удалось приблизить фото", Toast.LENGTH_LONG).show()
-                            } else if (aiOn) {
-                                enhanceAsync(u, shotZoom, name)
+                            if (ok) {
+                                Toast.makeText(this@MainActivity, "Фото очищено от шума", Toast.LENGTH_SHORT).show()
+                            } else {
+                                Toast.makeText(this@MainActivity, "Не удалось очистить фото, оставил как есть", Toast.LENGTH_LONG).show()
                             }
+                            if ((ok || extraZ <= 1.02f) && aiOn) enhanceAsync(u, shotZoom, name)
                         }
                     }.start()
-                } else if (aiOn && u != null) {
-                    enhanceAsync(u, shotZoom, name)
                 }
             }
             override fun onError(e: ImageCaptureException) {
@@ -533,8 +582,8 @@ class MainActivity : AppCompatActivity() {
         })
     }
 
-    // Программный зум для фото: берём центр снимка и растягиваем обратно до исходного размера
-    private fun cropUpscale(uri: Uri, extra: Float): Boolean {
+    // Обработка фото после съёмки: чистим цветной шум, а при зуме выше аппаратного берём центр кадра и растягиваем
+    private fun processPhoto(uri: Uri, extra: Float, strong: Boolean): Boolean {
         val bytes = contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: return false
         val bo = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bo)
@@ -549,28 +598,351 @@ class MainActivity : AppCompatActivity() {
             ExifInterface.ORIENTATION_ROTATE_270 -> 270f
             else -> 0f
         }
-        val cw = (w0 / extra).toInt().coerceIn(16, w0)
-        val ch = (h0 / extra).toInt().coerceIn(16, h0)
-        val left = (w0 - cw) / 2
-        val top = (h0 - ch) / 2
-        @Suppress("DEPRECATION")
-        val dec = BitmapRegionDecoder.newInstance(bytes, 0, bytes.size, false) ?: return false
-        var crop = dec.decodeRegion(Rect(left, top, left + cw, top + ch), null)
-        dec.recycle()
-        if (crop == null) return false
+        val crop = extra > 1.02f
+        var bmp: Bitmap
+        if (crop) {
+            val cw = (w0 / extra).toInt().coerceIn(16, w0)
+            val ch = (h0 / extra).toInt().coerceIn(16, h0)
+            val left = (w0 - cw) / 2
+            val top = (h0 - ch) / 2
+            @Suppress("DEPRECATION")
+            val dec = BitmapRegionDecoder.newInstance(bytes, 0, bytes.size, false) ?: return false
+            val part = dec.decodeRegion(Rect(left, top, left + cw, top + ch), null)
+            dec.recycle()
+            if (part == null) return false
+            bmp = if (part.isMutable) part else (part.copy(Bitmap.Config.ARGB_8888, true) ?: return false)
+        } else {
+            val o = BitmapFactory.Options().apply {
+                inMutable = true
+                inPreferredConfig = Bitmap.Config.ARGB_8888
+            }
+            bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, o) ?: return false
+        }
+        // шум убираем на родном разрешении, пока картинка ещё не растянута
+        cleanNoise(bmp, strong)
         if (deg != 0f) {
             val m = Matrix().apply { postRotate(deg) }
-            crop = Bitmap.createBitmap(crop, 0, 0, crop.width, crop.height, m, true)
+            val rot = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, m, true)
+            if (rot !== bmp) bmp.recycle()
+            bmp = rot
         }
-        val swap = deg == 90f || deg == 270f
-        val outW = if (swap) h0 else w0
-        val outH = if (swap) w0 else h0
-        val big = Bitmap.createScaledBitmap(crop, outW, outH, true)
+        if (crop) {
+            val swap = deg == 90f || deg == 270f
+            val outW = if (swap) h0 else w0
+            val outH = if (swap) w0 else h0
+            val big = Bitmap.createScaledBitmap(bmp, outW, outH, true)
+            if (big !== bmp) bmp.recycle()
+            bmp = big
+        }
         val bos = ByteArrayOutputStream()
-        big.compress(Bitmap.CompressFormat.JPEG, 95, bos)
+        bmp.compress(Bitmap.CompressFormat.JPEG, 97, bos)
         val out = contentResolver.openOutputStream(uri, "wt") ?: return false
         out.use { it.write(bos.toByteArray()) }
         return true
+    }
+
+    private fun halve(b: Bitmap): Bitmap =
+        Bitmap.createScaledBitmap(b, maxOf(1, b.width / 2), maxOf(1, b.height / 2), true)
+
+    private fun planeOf(bmp: Bitmap): FloatArray {
+        val w = bmp.width
+        val h = bmp.height
+        val px = IntArray(w * h)
+        bmp.getPixels(px, 0, w, 0, 0, w, h)
+        val out = FloatArray(w * h)
+        for (i in px.indices) {
+            val p = px[i]
+            out[i] = 0.299f * ((p shr 16) and 255) + 0.587f * ((p shr 8) and 255) + 0.114f * (p and 255)
+        }
+        return out
+    }
+
+    private fun upPlane(src: FloatArray, sw: Int, sh: Int, dw: Int, dh: Int): FloatArray {
+        val out = FloatArray(dw * dh)
+        val x0 = IntArray(dw); val x1 = IntArray(dw); val xt = FloatArray(dw)
+        for (x in 0 until dw) {
+            val f = (x + 0.5f) * sw / dw - 0.5f
+            val i = floor(f).toInt()
+            x0[x] = i.coerceIn(0, sw - 1); x1[x] = (i + 1).coerceIn(0, sw - 1); xt[x] = f - i
+        }
+        for (y in 0 until dh) {
+            val f = (y + 0.5f) * sh / dh - 0.5f
+            val i = floor(f).toInt()
+            val t = f - i
+            val r0 = i.coerceIn(0, sh - 1) * sw
+            val r1 = (i + 1).coerceIn(0, sh - 1) * sw
+            for (x in 0 until dw) {
+                val a = xt[x]
+                out[y * dw + x] = (src[r0 + x0[x]] * (1 - a) + src[r0 + x1[x]] * a) * (1 - t) +
+                    (src[r1 + x0[x]] * (1 - a) + src[r1 + x1[x]] * a) * t
+            }
+        }
+        return out
+    }
+
+    // оценка уровня шума по медиане отклонений (устойчива к настоящим краям)
+    private fun histSigma(hist: IntArray, n: Int): Float {
+        var acc = 0
+        val half = n / 2
+        for (b in hist.indices) {
+            acc += hist[b]
+            if (acc > half) return (b + 0.5f) / 4f * 1.4826f + 0.05f
+        }
+        return 1f
+    }
+
+    private fun planeSigma(y: FloatArray, base: FloatArray, step: Int): Float {
+        val hist = IntArray(1024)
+        var n = 0
+        var i = 0
+        while (i < y.size) {
+            val b = minOf(1023, (abs(y[i] - base[i]) * 4f).toInt())
+            hist[b]++; n++
+            i += step
+        }
+        return histSigma(hist, n)
+    }
+
+    // сжимаем отклонения от размытой основы: мелкое зерно уходит, настоящие контуры остаются
+    private fun shrinkLevel(y: FloatArray, base: FloatArray, c: Float, sig: Float): FloatArray {
+        val out = FloatArray(y.size)
+        for (i in y.indices) {
+            val b0 = base[i]
+            val d = y[i] - b0
+            val cl = c * sig * (1.3f - 0.6f * minOf(b0, 200f) / 200f)
+            out[i] = b0 + d * d / (d * d + cl * cl + 1e-6f) * d
+        }
+        return out
+    }
+
+    // Шумоподавление: яркость чистим по уровням (пирамида), цвет берём из очень размытой копии
+    private fun cleanNoise(bmp: Bitmap, strong: Boolean) {
+        val w = bmp.width
+        val h = bmp.height
+        if (w < 16 || h < 16) return
+        val half = halve(bmp)
+        val q = halve(half)
+        val e = halve(q)
+        val e16 = halve(e)
+        val y8 = planeOf(e)
+        val st = strong || y8.average() < 70.0   // тёмный кадр чистим сильнее
+        val cs = if (st) e16 else e
+        val cw = cs.width
+        val ch = cs.height
+        val cp = IntArray(cw * ch)
+        cs.getPixels(cp, 0, cw, 0, 0, cw, ch)
+        val cb = FloatArray(cw * ch)
+        val cr = FloatArray(cw * ch)
+        for (i in cp.indices) {
+            val p = cp[i]
+            val r = (p shr 16) and 255
+            val g = (p shr 8) and 255
+            val b = p and 255
+            val y = 0.299f * r + 0.587f * g + 0.114f * b
+            cb[i] = (b - y) * 0.564f
+            cr[i] = (r - y) * 0.713f
+        }
+        val hw = half.width; val hh = half.height
+        val qw = q.width; val qh = q.height
+        val ew = e.width; val eh = e.height
+        val y2 = planeOf(half)
+        val y4 = planeOf(q)
+        half.recycle(); q.recycle(); e.recycle(); e16.recycle()
+
+        val c = if (st) 2.5f else 1.8f
+        var base = upPlane(y8, ew, eh, qw, qh)
+        var r = shrinkLevel(y4, base, c, planeSigma(y4, base, 1))
+        base = upPlane(r, qw, qh, hw, hh)
+        val r2 = shrinkLevel(y2, base, c, planeSigma(y2, base, 2))
+
+        val cx0 = IntArray(w); val cx1 = IntArray(w); val cxt = FloatArray(w)
+        val hx0 = IntArray(w); val hx1 = IntArray(w); val hxt = FloatArray(w)
+        for (x in 0 until w) {
+            val fc = (x + 0.5f) * cw / w - 0.5f
+            val ci = floor(fc).toInt()
+            cx0[x] = ci.coerceIn(0, cw - 1); cx1[x] = (ci + 1).coerceIn(0, cw - 1); cxt[x] = fc - ci
+            val fh = (x + 0.5f) * hw / w - 0.5f
+            val hi = floor(fh).toInt()
+            hx0[x] = hi.coerceIn(0, hw - 1); hx1[x] = (hi + 1).coerceIn(0, hw - 1); hxt[x] = fh - hi
+        }
+        val rowsPer = 32
+        val buf = IntArray(w * rowsPer)
+
+        // уровень шума на полном разрешении (по каждой третьей точке)
+        val hist = IntArray(1024)
+        var hn = 0
+        var s0 = 0
+        while (s0 < h) {
+            val rows = minOf(rowsPer, h - s0)
+            bmp.getPixels(buf, 0, w, 0, s0, w, rows)
+            var ry = 0
+            while (ry < rows) {
+                val y = s0 + ry
+                val fhy = (y + 0.5f) * hh / h - 0.5f
+                val hyi = floor(fhy).toInt()
+                val hyt = fhy - hyi
+                val hy0 = hyi.coerceIn(0, hh - 1) * hw
+                val hy1 = (hyi + 1).coerceIn(0, hh - 1) * hw
+                var x = 0
+                while (x < w) {
+                    val p = buf[ry * w + x]
+                    val yy = 0.299f * ((p shr 16) and 255) + 0.587f * ((p shr 8) and 255) + 0.114f * (p and 255)
+                    val ah = hxt[x]
+                    val bs = (r2[hy0 + hx0[x]] * (1 - ah) + r2[hy0 + hx1[x]] * ah) * (1 - hyt) +
+                        (r2[hy1 + hx0[x]] * (1 - ah) + r2[hy1 + hx1[x]] * ah) * hyt
+                    hist[minOf(1023, (abs(yy - bs) * 4f).toInt())]++
+                    hn++
+                    x += 3
+                }
+                ry += 3
+            }
+            s0 += rows
+        }
+        val sig1 = histSigma(hist, hn)
+
+        var y0 = 0
+        while (y0 < h) {
+            val rows = minOf(rowsPer, h - y0)
+            bmp.getPixels(buf, 0, w, 0, y0, w, rows)
+            for (ry in 0 until rows) {
+                val y = y0 + ry
+                val fcy = (y + 0.5f) * ch / h - 0.5f
+                val cyi = floor(fcy).toInt()
+                val cyt = fcy - cyi
+                val cy0 = cyi.coerceIn(0, ch - 1) * cw
+                val cy1 = (cyi + 1).coerceIn(0, ch - 1) * cw
+                val fhy = (y + 0.5f) * hh / h - 0.5f
+                val hyi = floor(fhy).toInt()
+                val hyt = fhy - hyi
+                val hy0 = hyi.coerceIn(0, hh - 1) * hw
+                val hy1 = (hyi + 1).coerceIn(0, hh - 1) * hw
+                for (x in 0 until w) {
+                    val idx = ry * w + x
+                    val p = buf[idx]
+                    val pr = (p shr 16) and 255
+                    val pg = (p shr 8) and 255
+                    val pb = p and 255
+                    val yy = 0.299f * pr + 0.587f * pg + 0.114f * pb
+                    val a = cxt[x]
+                    val i00 = cy0 + cx0[x]; val i01 = cy0 + cx1[x]
+                    val i10 = cy1 + cx0[x]; val i11 = cy1 + cx1[x]
+                    val cbv = (cb[i00] * (1 - a) + cb[i01] * a) * (1 - cyt) + (cb[i10] * (1 - a) + cb[i11] * a) * cyt
+                    val crv = (cr[i00] * (1 - a) + cr[i01] * a) * (1 - cyt) + (cr[i10] * (1 - a) + cr[i11] * a) * cyt
+                    val ah = hxt[x]
+                    val bs = (r2[hy0 + hx0[x]] * (1 - ah) + r2[hy0 + hx1[x]] * ah) * (1 - hyt) +
+                        (r2[hy1 + hx0[x]] * (1 - ah) + r2[hy1 + hx1[x]] * ah) * hyt
+                    val d = yy - bs
+                    val cl = c * sig1 * (1.3f - 0.6f * minOf(bs, 200f) / 200f)
+                    val ny = bs + d * d / (d * d + cl * cl + 1e-6f) * d
+                    var nr = ny + 1.403f * crv
+                    var nb = ny + 1.773f * cbv
+                    var ng = (ny - 0.299f * nr - 0.114f * nb) / 0.587f
+                    if (nr < 0f) nr = 0f else if (nr > 255f) nr = 255f
+                    if (ng < 0f) ng = 0f else if (ng > 255f) ng = 255f
+                    if (nb < 0f) nb = 0f else if (nb > 255f) nb = 255f
+                    buf[idx] = (0xFF shl 24) or (nr.toInt() shl 16) or (ng.toInt() shl 8) or nb.toInt()
+                }
+            }
+            bmp.setPixels(buf, 0, w, 0, y0, w, rows)
+            y0 += rows
+        }
+    }
+
+    // ---------- Кнопки: фиксация фокуса и стабилизация ----------
+    // 0 = нет, 1 = оптическая, 2 = электронная
+    private fun stabKind(cam: Camera): Int {
+        return try {
+            val c2 = Camera2CameraInfo.from(cam.cameraInfo)
+            val ois = c2.getCameraCharacteristic(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION)
+            val eis = c2.getCameraCharacteristic(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES)
+            if (ois != null && ois.contains(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON)) 1
+            else if (eis != null && eis.contains(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON)) 2
+            else 0
+        } catch (e: Exception) {
+            0
+        }
+    }
+
+    private fun makeSideBtn(label: String): TextView {
+        val t = TextView(this)
+        t.text = label
+        t.setTextSize(TypedValue.COMPLEX_UNIT_PX, aiBtn.textSize)
+        t.gravity = aiBtn.gravity
+        t.setTextColor(aiBtn.textColors)
+        t.typeface = aiBtn.typeface
+        t.setPadding(aiBtn.paddingLeft, aiBtn.paddingTop, aiBtn.paddingRight, aiBtn.paddingBottom)
+        aiBtn.background?.constantState?.newDrawable()?.let { t.background = it.mutate() }
+        return t
+    }
+
+    private fun addExtraButtons() {
+        focusBtn = makeSideBtn("🎯")
+        stabBtn = makeSideBtn("🛡")
+        val parent = aiBtn.parent as? ViewGroup
+        if (parent is LinearLayout) {
+            val idx = parent.indexOfChild(aiBtn)
+            fun copyLp(): ViewGroup.LayoutParams {
+                val l = aiBtn.layoutParams
+                return try {
+                    l.javaClass.getConstructor(l.javaClass).newInstance(l) as ViewGroup.LayoutParams
+                } catch (e: Throwable) {
+                    ViewGroup.MarginLayoutParams(l)
+                }
+            }
+            parent.addView(focusBtn, idx + 1, copyLp())
+            parent.addView(stabBtn, idx + 2, copyLp())
+        } else {
+            // запасной вариант: отдельная колонка слева по центру экрана
+            val d = resources.displayMetrics.density
+            val col = LinearLayout(this)
+            col.orientation = LinearLayout.VERTICAL
+            val size = (50 * d).toInt()
+            val gap = (10 * d).toInt()
+            col.addView(focusBtn, LinearLayout.LayoutParams(size, size).apply { bottomMargin = gap })
+            col.addView(stabBtn, LinearLayout.LayoutParams(size, size))
+            val flp = FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.START or Gravity.CENTER_VERTICAL
+            )
+            flp.leftMargin = (12 * d).toInt()
+            findViewById<ViewGroup>(android.R.id.content).addView(col, flp)
+        }
+        focusBtn.setOnClickListener { toggleFocusLock() }
+        stabBtn.setOnClickListener { toggleStab() }
+        pressFx(focusBtn)
+        pressFx(stabBtn)
+    }
+
+    private fun toggleFocusLock() {
+        val cam = camera ?: return
+        focusLocked = !focusLocked
+        if (focusLocked) {
+            val pt = previewView.meteringPointFactory.createPoint(previewView.width / 2f, previewView.height / 2f)
+            cam.cameraControl.startFocusAndMetering(
+                FocusMeteringAction.Builder(pt, FocusMeteringAction.FLAG_AF).disableAutoCancel().build()
+            )
+            showFocusRing(previewView.width / 2f, previewView.height / 2f)
+            Toast.makeText(this, "Фокус зафиксирован. Тапни по предмету, чтобы навести на него", Toast.LENGTH_LONG).show()
+        } else {
+            cam.cameraControl.cancelFocusAndMetering()
+            Toast.makeText(this, "Автофокус включён", Toast.LENGTH_SHORT).show()
+        }
+        updateModeUi()
+        applyMode()
+    }
+
+    private fun toggleStab() {
+        val cam = camera ?: return
+        val kind = stabKind(cam)
+        if (kind == 0) {
+            Toast.makeText(this, "Этот телефон не поддерживает стабилизацию камеры", Toast.LENGTH_LONG).show()
+            return
+        }
+        stabOn = !stabOn
+        updateModeUi()
+        applyMode()
+        val how = if (kind == 1) "оптическая" else "электронная"
+        Toast.makeText(this, if (stabOn) "Стабилизация включена ($how)" else "Стабилизация выключена", Toast.LENGTH_SHORT).show()
     }
 
     // ---------- ИИ-улучшение фото при зуме ----------
@@ -641,7 +1013,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     // ESRGAN x4 по плиткам с нахлёстом, чтобы не было швов
-    private fun superRes(src: Bitmap, progress: (Int) -> Unit): Bitmap? {
+    private fun superRes(src: Bitmap, budgetMs: Long = 0L, progress: (Int) -> Unit): Bitmap? {
         val bytes = try { assets.open("esrgan.tflite").readBytes() } catch (e: Exception) { return null }
         val model = ByteBuffer.allocateDirect(bytes.size).order(ByteOrder.nativeOrder())
         model.put(bytes)
@@ -666,6 +1038,7 @@ class MainActivity : AppCompatActivity() {
             val cols = (w + core - 1) / core
             val rows = (h + core - 1) / core
             var done = 0
+            val tStart = SystemClock.elapsedRealtime()
             var ty = 0
             while (ty < h) {
                 var tx = 0
@@ -701,6 +1074,10 @@ class MainActivity : AppCompatActivity() {
                     }
                     out.setPixels(tile, 0, tw, tx * sc, ty * sc, tw, th)
                     done++
+                    if (budgetMs > 0L && done == 3 && cols * rows > 8) {
+                        val est = (SystemClock.elapsedRealtime() - tStart) / 3f * cols * rows
+                        if (est > budgetMs * 1.1f) throw TooSlow(kotlin.math.sqrt(budgetMs / est))
+                    }
                     if (done % 5 == 0) progress(done * 100 / (cols * rows))
                     tx += core
                 }
@@ -729,6 +1106,7 @@ class MainActivity : AppCompatActivity() {
         dlgStatus = v.findViewById(R.id.enStatus)
         dlgPreview = v.findViewById(R.id.enPreview)
         dlgPick = v.findViewById(R.id.enPick)
+        dlgPick?.text = "📁 Выбрать фото или видео"
         val sw = v.findViewById<SwitchCompat>(R.id.enAuto)
         sw.isChecked = aiOn
         sw.setOnCheckedChangeListener { _, on ->
@@ -737,8 +1115,8 @@ class MainActivity : AppCompatActivity() {
             applyMode()
         }
         dlgPick?.setOnClickListener {
-            if (aiBusy) Toast.makeText(this, "Подожди, ИИ ещё обрабатывает прошлое фото", Toast.LENGTH_SHORT).show()
-            else pickPhoto.launch("image/*")
+            if (aiBusy) Toast.makeText(this, "Подожди, ИИ ещё обрабатывает прошлый файл", Toast.LENGTH_SHORT).show()
+            else pickPhoto.launch(arrayOf("image/*", "video/*"))
         }
         val close = v.findViewById<View>(R.id.enClose)
         close.setOnClickListener { dlg?.dismiss() }
@@ -768,6 +1146,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun enhancePicked(uri: Uri) {
+        val type = contentResolver.getType(uri) ?: ""
+        if (type.startsWith("video")) enhanceVideoPicked(uri) else enhancePhotoPicked(uri)
+    }
+
+    private fun enhancePhotoPicked(uri: Uri) {
         if (aiBusy) return
         aiBusy = true
         dlgPick?.alpha = 0.4f
@@ -776,24 +1159,42 @@ class MainActivity : AppCompatActivity() {
         Thread {
             var msg: String
             var prev: Bitmap? = null
+            val t0 = SystemClock.elapsedRealtime()
             try {
-                val src = loadForEnhance(uri, 800)
-                if (src == null) {
+                val cb: (Int) -> Unit = { pr ->
+                    runOnUiThread {
+                        setEnhanceUi("ИИ улучшает… " + pr + "%", pr)
+                        infoText.text = "ИИ " + pr + "%"
+                    }
+                }
+                var side = 640
+                val first = loadForEnhance(uri, side)
+                if (first == null) {
                     msg = "Не удалось открыть это фото"
                 } else {
-                    val big = superRes(src) { pr ->
-                        runOnUiThread {
-                            setEnhanceUi("ИИ улучшает… " + pr + "%", pr)
-                            infoText.text = "ИИ " + pr + "%"
+                    var src: Bitmap = first
+                    var big: Bitmap? = null
+                    var tries = 0
+                    // целимся в ~20 секунд: если по замеру выходит дольше, берём меньший размер исходника
+                    while (true) {
+                        tries++
+                        try {
+                            big = superRes(src, if (tries < 3) 18000L else 0L, cb)
+                            break
+                        } catch (e: TooSlow) {
+                            side = (side * e.factor * 0.95f).toInt().coerceAtLeast(160)
+                            src = loadForEnhance(uri, side) ?: break
                         }
                     }
-                    if (big == null) {
+                    val b = big
+                    if (b == null) {
                         msg = "Нет модели esrgan.tflite в приложении"
                     } else {
-                        saveJpeg(big, "ZoomCam_AI_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()))
-                        val ph = (600f * big.height / big.width).toInt().coerceAtLeast(1)
-                        prev = Bitmap.createScaledBitmap(big, 600, ph, true)
-                        msg = "Готово! " + big.width + "x" + big.height + ", фото сохранено в галерею"
+                        saveJpeg(b, "ZoomCam_AI_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()))
+                        val ph = (600f * b.height / b.width).toInt().coerceAtLeast(1)
+                        prev = Bitmap.createScaledBitmap(b, 600, ph, true)
+                        val sec = (SystemClock.elapsedRealtime() - t0) / 1000
+                        msg = "Готово за " + sec + " с! " + b.width + "x" + b.height + ", фото в галерее"
                     }
                 }
             } catch (e: Throwable) {
@@ -807,6 +1208,263 @@ class MainActivity : AppCompatActivity() {
                 Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
             }
         }.start()
+    }
+
+    private fun enhanceVideoPicked(uri: Uri) {
+        if (aiBusy) return
+        aiBusy = true
+        dlgPick?.alpha = 0.4f
+        dlgPreview?.visibility = View.GONE
+        setEnhanceUi("Открываю видео…", 0)
+        Thread {
+            var msg: String
+            var prev: Bitmap? = null
+            val t0 = SystemClock.elapsedRealtime()
+            try {
+                var lastPr = -1
+                val out = enhanceVideo(uri) { pr ->
+                    if (pr != lastPr) {
+                        lastPr = pr
+                        val sec = (SystemClock.elapsedRealtime() - t0) / 1000
+                        runOnUiThread {
+                            setEnhanceUi("Улучшаю видео… " + pr + "% (" + sec + " с)", pr)
+                            infoText.text = "Видео " + pr + "%"
+                        }
+                    }
+                }
+                prev = videoThumb(out)
+                val sec = (SystemClock.elapsedRealtime() - t0) / 1000
+                msg = "Видео готово за " + sec + " с, сохранено в галерею"
+            } catch (e: Throwable) {
+                msg = "Видео не получилось: " + e.message
+            }
+            runOnUiThread {
+                aiBusy = false
+                dlgPick?.alpha = 1f
+                infoText.text = "зум до " + fmt(maxZ) + "x"
+                setEnhanceUi(msg, null, prev)
+                Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+            }
+        }.start()
+    }
+
+    private fun videoThumb(uri: Uri): Bitmap? {
+        val r = MediaMetadataRetriever()
+        return try {
+            r.setDataSource(this, uri)
+            val f = r.getFrameAtTime(300_000L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC) ?: return null
+            val ph = (600f * f.height / f.width).toInt().coerceAtLeast(1)
+            Bitmap.createScaledBitmap(f, 600, ph, true)
+        } catch (e: Throwable) {
+            null
+        } finally {
+            try { r.release() } catch (e: Throwable) {}
+        }
+    }
+
+    private fun align16(v: Float): Int = (Math.round(v / 16f) * 16).coerceAtLeast(16)
+
+    // Видео: декодер -> GPU-фильтр (убирает шум и «квадраты», повышает резкость, увеличивает до ~1080p) -> кодер.
+    // Всё на видеокарте, поэтому идёт быстрее, чем если считать на процессоре. Звук копируется как есть.
+    private fun enhanceVideo(uri: Uri, onProgress: (Int) -> Unit): Uri {
+        val ex = MediaExtractor()
+        var audioEx: MediaExtractor? = null
+        var decoder: MediaCodec? = null
+        var encoder: MediaCodec? = null
+        var gl: VideoGl? = null
+        var muxer: MediaMuxer? = null
+        var pfd: android.os.ParcelFileDescriptor? = null
+        var outUri: Uri? = null
+        var ok = false
+        try {
+            ex.setDataSource(this, uri, null)
+            var vi = -1
+            var ai = -1
+            for (i in 0 until ex.trackCount) {
+                val m = ex.getTrackFormat(i).getString(MediaFormat.KEY_MIME) ?: continue
+                if (vi < 0 && m.startsWith("video/")) vi = i
+                if (ai < 0 && m.startsWith("audio/")) ai = i
+            }
+            if (vi < 0) throw IllegalStateException("в файле нет видео")
+            val vf = ex.getTrackFormat(vi)
+            val mime = vf.getString(MediaFormat.KEY_MIME)!!
+            val w = vf.getInteger(MediaFormat.KEY_WIDTH)
+            val h = vf.getInteger(MediaFormat.KEY_HEIGHT)
+            val rot = if (vf.containsKey(MediaFormat.KEY_ROTATION)) vf.getInteger(MediaFormat.KEY_ROTATION) else 0
+            val durUs = if (vf.containsKey(MediaFormat.KEY_DURATION)) vf.getLong(MediaFormat.KEY_DURATION) else 0L
+            val fps = (try {
+                vf.getInteger(MediaFormat.KEY_FRAME_RATE)
+            } catch (e: Throwable) {
+                try { vf.getFloat(MediaFormat.KEY_FRAME_RATE).toInt() } catch (e2: Throwable) { 30 }
+            }).coerceIn(15, 60)
+
+            // увеличиваем маленькое видео до ~1080p (максимум x2), большое оставляем как есть
+            val s0 = (1920f / maxOf(w, h)).coerceIn(1f, 2f)
+            var outW = w
+            var outH = h
+            var inSurf: Surface? = null
+            for (s in listOf(s0, 1f)) {
+                outW = align16(w * s)
+                outH = align16(h * s)
+                val br = (outW.toLong() * outH * fps * 0.22).toLong().coerceIn(6_000_000L, 45_000_000L).toInt()
+                val f = MediaFormat.createVideoFormat("video/avc", outW, outH)
+                f.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+                f.setInteger(MediaFormat.KEY_BIT_RATE, br)
+                f.setInteger(MediaFormat.KEY_FRAME_RATE, fps)
+                f.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+                try {
+                    val e = MediaCodec.createEncoderByType("video/avc")
+                    try {
+                        e.configure(f, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                        inSurf = e.createInputSurface()
+                        encoder = e
+                        break
+                    } catch (t: Throwable) {
+                        try { e.release() } catch (t2: Throwable) {}
+                    }
+                } catch (t: Throwable) {}
+            }
+            val enc = encoder ?: throw IllegalStateException("кодер видео не запустился")
+            enc.start()
+
+            val scale = outW.toFloat() / w
+            val g = VideoGl(inSurf!!, outW, outH, w, h, 0.7f + 0.5f * (scale - 1f))
+            gl = g
+            val dec = MediaCodec.createDecoderByType(mime)
+            decoder = dec
+            dec.configure(vf, g.decSurface, null, 0)
+            dec.start()
+            ex.selectTrack(vi)
+
+            if (ai >= 0) {
+                audioEx = MediaExtractor().also {
+                    it.setDataSource(this, uri, null)
+                    it.selectTrack(ai)
+                }
+            }
+
+            val name = "ZoomCam_AI_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+            val values = ContentValues().apply {
+                put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+                put(MediaStore.MediaColumns.MIME_TYPE, "video/mp4")
+                put(MediaStore.Video.Media.RELATIVE_PATH, "DCIM/Camera")
+                if (Build.VERSION.SDK_INT >= 29) put(MediaStore.MediaColumns.IS_PENDING, 1)
+            }
+            val ou = contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
+                ?: throw IllegalStateException("не удалось создать файл в галерее")
+            outUri = ou
+            pfd = contentResolver.openFileDescriptor(ou, "rw")
+            val mx = MediaMuxer(pfd!!.fileDescriptor, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+            mx.setOrientationHint(rot)
+            muxer = mx
+
+            val dinfo = MediaCodec.BufferInfo()
+            val einfo = MediaCodec.BufferInfo()
+            var extractorDone = false
+            var decDone = false
+            var encDone = false
+            var muxStarted = false
+            var vTrack = -1
+            var aTrack = -1
+            while (!encDone) {
+                if (!extractorDone) {
+                    val ii = dec.dequeueInputBuffer(5000)
+                    if (ii >= 0) {
+                        val buf = dec.getInputBuffer(ii)!!
+                        val sz = ex.readSampleData(buf, 0)
+                        if (sz < 0) {
+                            dec.queueInputBuffer(ii, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                            extractorDone = true
+                        } else {
+                            dec.queueInputBuffer(ii, 0, sz, ex.sampleTime, 0)
+                            ex.advance()
+                        }
+                    }
+                }
+                if (!decDone) {
+                    val oi = dec.dequeueOutputBuffer(dinfo, 5000)
+                    if (oi >= 0) {
+                        val render = dinfo.size > 0
+                        dec.releaseOutputBuffer(oi, render)
+                        if (render) {
+                            if (!g.awaitFrame()) throw IllegalStateException("декодер не отдал кадр")
+                            g.draw(dinfo.presentationTimeUs * 1000L)
+                            if (durUs > 0L) onProgress((dinfo.presentationTimeUs * 100L / durUs).toInt().coerceIn(0, 99))
+                        }
+                        if (dinfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
+                            decDone = true
+                            enc.signalEndOfInputStream()
+                        }
+                    }
+                }
+                while (true) {
+                    val ei = enc.dequeueOutputBuffer(einfo, if (decDone) 10_000L else 0L)
+                    if (ei == MediaCodec.INFO_TRY_AGAIN_LATER) break
+                    if (ei == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                        vTrack = mx.addTrack(enc.outputFormat)
+                        if (audioEx != null) {
+                            aTrack = try { mx.addTrack(audioEx.getTrackFormat(ai)) } catch (t: Throwable) { -1 }
+                        }
+                        mx.start()
+                        muxStarted = true
+                    } else if (ei >= 0) {
+                        val data = enc.getOutputBuffer(ei)!!
+                        if (einfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) einfo.size = 0
+                        if (einfo.size > 0 && muxStarted) {
+                            data.position(einfo.offset)
+                            data.limit(einfo.offset + einfo.size)
+                            mx.writeSampleData(vTrack, data, einfo)
+                        }
+                        enc.releaseOutputBuffer(ei, false)
+                        if (einfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
+                            encDone = true
+                            break
+                        }
+                    }
+                }
+            }
+            if (!muxStarted) throw IllegalStateException("видео получилось пустым")
+
+            // звук копируем без изменений
+            if (audioEx != null && aTrack >= 0) {
+                val ab = ByteBuffer.allocate(1 shl 18)
+                val abi = MediaCodec.BufferInfo()
+                while (true) {
+                    ab.clear()
+                    val sz = audioEx.readSampleData(ab, 0)
+                    if (sz < 0) break
+                    val fl = if (audioEx.sampleFlags and MediaExtractor.SAMPLE_FLAG_SYNC != 0) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0
+                    abi.set(0, sz, audioEx.sampleTime, fl)
+                    mx.writeSampleData(aTrack, ab, abi)
+                    audioEx.advance()
+                }
+            }
+            mx.stop()
+            mx.release()
+            muxer = null
+            pfd?.close()
+            pfd = null
+            if (Build.VERSION.SDK_INT >= 29) {
+                val cv = ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }
+                contentResolver.update(ou, cv, null, null)
+            }
+            onProgress(100)
+            ok = true
+            return ou
+        } finally {
+            try { decoder?.stop() } catch (t: Throwable) {}
+            try { decoder?.release() } catch (t: Throwable) {}
+            try { encoder?.stop() } catch (t: Throwable) {}
+            try { encoder?.release() } catch (t: Throwable) {}
+            try { gl?.release() } catch (t: Throwable) {}
+            try { muxer?.release() } catch (t: Throwable) {}
+            try { pfd?.close() } catch (t: Throwable) {}
+            try { ex.release() } catch (t: Throwable) {}
+            try { audioEx?.release() } catch (t: Throwable) {}
+            if (!ok && outUri != null) {
+                try { contentResolver.delete(outUri, null, null) } catch (t: Throwable) {}
+            }
+        }
     }
 
     // для выбранного из галереи фото: уменьшаем до maxSide по длинной стороне (убирает «квадраты») и поворачиваем как надо
@@ -868,6 +1526,10 @@ class MainActivity : AppCompatActivity() {
         setSel(nightBtn, mode == 1)
         setSel(dayBtn, mode == 2)
         setSel(aiBtn, aiOn)
+        if (this::focusBtn.isInitialized) {
+            setSel(focusBtn, focusLocked)
+            setSel(stabBtn, stabOn)
+        }
     }
 
     private fun updatePills() {
@@ -933,7 +1595,7 @@ class MainActivity : AppCompatActivity() {
             val edgeModes = c2info.getCameraCharacteristic(CameraCharacteristics.EDGE_AVAILABLE_EDGE_MODES)
             val b = CaptureRequestOptions.Builder()
             // сглаживание при сильном зуме: сильное шумоподавление и без излишней резкости (она подчёркивает «квадраты»)
-            if (aiOn && fpsIndex == 0) {
+            if (fpsIndex == 0) {
                 if (nrModes != null && nrModes.contains(CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY)) {
                     b.setCaptureRequestOption(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY)
                 }
@@ -952,6 +1614,26 @@ class MainActivity : AppCompatActivity() {
             }
             if (mode == 1 && nrModes != null && nrModes.contains(CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY)) {
                 b.setCaptureRequestOption(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY)
+            }
+            // плавный автофокус при записи видео: без «наезда» размытия, когда двигаешь телефон
+            if (isRecording && !focusLocked) {
+                val afModes = c2info.getCameraCharacteristic(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES)
+                if (afModes != null && afModes.contains(CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)) {
+                    b.setCaptureRequestOption(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
+                }
+            }
+            // стабилизация: оптическая, а если её нет, то электронная
+            val kind = stabKind(cam)
+            if (kind == 1) {
+                b.setCaptureRequestOption(
+                    CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
+                    if (stabOn) CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON else CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_OFF
+                )
+            } else if (kind == 2) {
+                b.setCaptureRequestOption(
+                    CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
+                    if (stabOn) CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON else CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_OFF
+                )
             }
             Camera2CameraControl.from(cam.cameraControl).setCaptureRequestOptions(b.build())
         } catch (e: Exception) {
@@ -1002,4 +1684,144 @@ class MainActivity : AppCompatActivity() {
         if (maxZ <= minZ) 0 else (ln(z / minZ) / ln(maxZ / minZ) * 1000f).toInt().coerceIn(0, 1000)
 
     private fun fmt(z: Float) = if (z >= 10f) z.toInt().toString() else String.format(Locale.US, "%.1f", z)
+}
+
+private class TooSlow(val factor: Float) : Exception("слишком долго")
+
+// GPU-фильтр для видео: кадр с декодера -> шумоподавление с сохранением краёв + резкость -> окно кодера
+private class VideoGl(
+    outSurface: Surface,
+    private val outW: Int,
+    private val outH: Int,
+    private val srcW: Int,
+    private val srcH: Int,
+    private val sharp: Float
+) {
+    private var dpy: EGLDisplay = EGL14.EGL_NO_DISPLAY
+    private var ctx: EGLContext = EGL14.EGL_NO_CONTEXT
+    private var surf: EGLSurface = EGL14.EGL_NO_SURFACE
+    private var prog = 0
+    private var tex = 0
+    private val tm = FloatArray(16)
+    private val frames = Semaphore(0)
+    val st: SurfaceTexture
+    val decSurface: Surface
+    private val quad: FloatBuffer = ByteBuffer.allocateDirect(16 * 4).order(ByteOrder.nativeOrder()).asFloatBuffer().apply {
+        put(floatArrayOf(-1f, -1f, 0f, 0f, 1f, -1f, 1f, 0f, -1f, 1f, 0f, 1f, 1f, 1f, 1f, 1f))
+        position(0)
+    }
+
+    init {
+        dpy = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY)
+        val ver = IntArray(2)
+        EGL14.eglInitialize(dpy, ver, 0, ver, 1)
+        val attrs = intArrayOf(
+            EGL14.EGL_RED_SIZE, 8, EGL14.EGL_GREEN_SIZE, 8, EGL14.EGL_BLUE_SIZE, 8, EGL14.EGL_ALPHA_SIZE, 8,
+            EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT, 0x3142, 1, EGL14.EGL_NONE
+        )
+        val cfgs = arrayOfNulls<EGLConfig>(1)
+        val n = IntArray(1)
+        EGL14.eglChooseConfig(dpy, attrs, 0, cfgs, 0, 1, n, 0)
+        ctx = EGL14.eglCreateContext(dpy, cfgs[0], EGL14.EGL_NO_CONTEXT, intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE), 0)
+        surf = EGL14.eglCreateWindowSurface(dpy, cfgs[0], outSurface, intArrayOf(EGL14.EGL_NONE), 0)
+        EGL14.eglMakeCurrent(dpy, surf, surf, ctx)
+
+        val vs = "uniform mat4 uTm;attribute vec4 aPos;attribute vec2 aTex;varying vec2 vTex;" +
+            "void main(){gl_Position=aPos;vTex=(uTm*vec4(aTex,0.0,1.0)).xy;}"
+        val fs = "#extension GL_OES_EGL_image_external : require\n" +
+            "precision mediump float;varying vec2 vTex;uniform samplerExternalOES sTex;" +
+            "uniform vec2 uPx;uniform float uDen;uniform float uSharp;" +
+            "void main(){" +
+            "vec3 c=texture2D(sTex,vTex).rgb;vec3 acc=c;float ws=1.0;vec3 mean=c;" +
+            "for(int i=-1;i<=1;i++){for(int j=-1;j<=1;j++){" +
+            "if(i==0&&j==0)continue;" +
+            "vec3 s=texture2D(sTex,vTex+vec2(float(i),float(j))*uPx).rgb;" +
+            "vec3 d=s-c;float w=exp(-dot(d,d)*uDen);acc+=s*w;ws+=w;mean+=s;}}" +
+            "vec3 den=acc/ws;vec3 blur=mean/9.0;" +
+            "vec3 o=den+(den-blur)*uSharp;" +
+            "float l=dot(o,vec3(0.299,0.587,0.114));" +
+            "o=mix(vec3(l),o,1.08);o=(o-0.5)*1.04+0.5;" +
+            "gl_FragColor=vec4(clamp(o,0.0,1.0),1.0);}"
+        val v = compile(GLES20.GL_VERTEX_SHADER, vs)
+        val f = compile(GLES20.GL_FRAGMENT_SHADER, fs)
+        prog = GLES20.glCreateProgram()
+        GLES20.glAttachShader(prog, v)
+        GLES20.glAttachShader(prog, f)
+        GLES20.glLinkProgram(prog)
+        val ls = IntArray(1)
+        GLES20.glGetProgramiv(prog, GLES20.GL_LINK_STATUS, ls, 0)
+        if (ls[0] == 0) throw RuntimeException("GL программа не собралась")
+
+        val t = IntArray(1)
+        GLES20.glGenTextures(1, t, 0)
+        tex = t[0]
+        GLES20.glBindTexture(0x8D65, tex)
+        GLES20.glTexParameteri(0x8D65, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(0x8D65, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(0x8D65, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+        GLES20.glTexParameteri(0x8D65, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+        st = SurfaceTexture(tex)
+        st.setOnFrameAvailableListener(
+            SurfaceTexture.OnFrameAvailableListener { frames.release() },
+            android.os.Handler(android.os.Looper.getMainLooper())
+        )
+        decSurface = Surface(st)
+    }
+
+    private fun compile(type: Int, src: String): Int {
+        val s = GLES20.glCreateShader(type)
+        GLES20.glShaderSource(s, src)
+        GLES20.glCompileShader(s)
+        val ok = IntArray(1)
+        GLES20.glGetShaderiv(s, GLES20.GL_COMPILE_STATUS, ok, 0)
+        if (ok[0] == 0) {
+            val log = GLES20.glGetShaderInfoLog(s)
+            GLES20.glDeleteShader(s)
+            throw RuntimeException("шейдер: " + log)
+        }
+        return s
+    }
+
+    fun awaitFrame(): Boolean {
+        if (!frames.tryAcquire(3, TimeUnit.SECONDS)) return false
+        st.updateTexImage()
+        st.getTransformMatrix(tm)
+        return true
+    }
+
+    fun draw(ptsNs: Long) {
+        GLES20.glViewport(0, 0, outW, outH)
+        GLES20.glUseProgram(prog)
+        val aPos = GLES20.glGetAttribLocation(prog, "aPos")
+        val aTex = GLES20.glGetAttribLocation(prog, "aTex")
+        quad.position(0)
+        GLES20.glVertexAttribPointer(aPos, 2, GLES20.GL_FLOAT, false, 16, quad)
+        GLES20.glEnableVertexAttribArray(aPos)
+        quad.position(2)
+        GLES20.glVertexAttribPointer(aTex, 2, GLES20.GL_FLOAT, false, 16, quad)
+        GLES20.glEnableVertexAttribArray(aTex)
+        GLES20.glUniformMatrix4fv(GLES20.glGetUniformLocation(prog, "uTm"), 1, false, tm, 0)
+        GLES20.glUniform2f(GLES20.glGetUniformLocation(prog, "uPx"), 1f / srcW, 1f / srcH)
+        GLES20.glUniform1f(GLES20.glGetUniformLocation(prog, "uDen"), 250f)
+        GLES20.glUniform1f(GLES20.glGetUniformLocation(prog, "uSharp"), sharp)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(0x8D65, tex)
+        GLES20.glUniform1i(GLES20.glGetUniformLocation(prog, "sTex"), 0)
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+        EGLExt.eglPresentationTimeANDROID(dpy, surf, ptsNs)
+        EGL14.eglSwapBuffers(dpy, surf)
+    }
+
+    fun release() {
+        try { decSurface.release() } catch (t: Throwable) {}
+        try { st.release() } catch (t: Throwable) {}
+        if (dpy != EGL14.EGL_NO_DISPLAY) {
+            EGL14.eglMakeCurrent(dpy, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT)
+            EGL14.eglDestroySurface(dpy, surf)
+            EGL14.eglDestroyContext(dpy, ctx)
+            EGL14.eglReleaseThread()
+            EGL14.eglTerminate(dpy)
+        }
+        dpy = EGL14.EGL_NO_DISPLAY
+    }
 }
