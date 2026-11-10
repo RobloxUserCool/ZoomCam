@@ -1725,44 +1725,20 @@ class MainActivity : AppCompatActivity() {
             try {
                 val cb: (Int) -> Unit = { pr ->
                     runOnUiThread {
-                        setEnhanceUi("ИИ улучшает… " + pr + "%", pr)
-                        infoText.text = "ИИ " + pr + "%"
+                        setEnhanceUi("Убираю шум… " + pr + "%", pr)
+                        infoText.text = "Фото " + pr + "%"
                     }
                 }
-                var side = 900
-                val first = loadForEnhance(uri, side, true)
-                if (first == null) {
+                val src = loadForEnhance(uri, 1600, false)
+                if (src == null) {
                     msg = "Не удалось открыть это фото"
                 } else {
-                    var src: Bitmap = first
-                    var big: Bitmap? = null
-                    var tries = 0
-                    // целимся в ~20 секунд: если по замеру выходит дольше, берём меньший размер исходника
-                    while (true) {
-                        tries++
-                        try {
-                            big = superRes(src, if (tries < 3) 30000L else 0L, cb)
-                            break
-                        } catch (e: TooSlow) {
-                            side = (side * e.factor * 0.95f).toInt().coerceAtLeast(160)
-                            src = loadForEnhance(uri, side, true) ?: break
-                        }
-                    }
-                    val b = big
-                    if (b == null) {
-                        msg = "Нет модели esrgan.tflite в приложении"
-                    } else {
-                        try {
-                            val up = Bitmap.createScaledBitmap(src, b.width, b.height, true)
-                            android.graphics.Canvas(b).drawBitmap(up, 0f, 0f, android.graphics.Paint().apply { alpha = 80 })
-                            if (up !== src) up.recycle()
-                        } catch (t: Throwable) {}
-                        saveJpeg(b, "ZoomCam_AI_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()))
-                        val ph = (600f * b.height / b.width).toInt().coerceAtLeast(1)
-                        prev = Bitmap.createScaledBitmap(b, 600, ph, true)
-                        val sec = (SystemClock.elapsedRealtime() - t0) / 1000
-                        msg = "Готово за " + sec + " с! " + b.width + "x" + b.height + ", фото в галерее"
-                    }
+                    val res = NlmDenoise.run(src, cb)
+                    saveJpeg(res, "ZoomCam_AI_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()))
+                    val ph = (600f * res.height / res.width).toInt().coerceAtLeast(1)
+                    prev = Bitmap.createScaledBitmap(res, 600, ph, true)
+                    val sec = (SystemClock.elapsedRealtime() - t0) / 1000
+                    msg = "Готово за " + sec + " с! " + res.width + "x" + res.height + ", шум убран, фото в галерее"
                 }
             } catch (e: Throwable) {
                 msg = "Не получилось: " + e.message
@@ -2574,5 +2550,291 @@ private data class MediaItem(val id: Long, val video: Boolean, val uri: Uri)
 private class SquareFrame(ctx: android.content.Context) : FrameLayout(ctx) {
     override fun onMeasure(w: Int, h: Int) {
         super.onMeasure(w, w)
+    }
+}
+
+// Шумоподавление фото (Non-Local Means): ищет похожие кусочки картинки рядом и усредняет их.
+// Шум исчезает, а края и мелкие детали остаются. Нейросеть тут вредила: принимала зерно за детали.
+private object NlmDenoise {
+    private fun estimateSigma(y: FloatArray, w: Int, h: Int): Float {
+        var sum = 0.0
+        var n = 0L
+        var j = 1
+        while (j < h - 1) {
+            var i = 1
+            while (i < w - 1) {
+                val k = j * w + i
+                val v = y[k - w - 1] - 2f * y[k - w] + y[k - w + 1] - 2f * y[k - 1] + 4f * y[k] - 2f * y[k + 1] + y[k + w - 1] - 2f * y[k + w] + y[k + w + 1]
+                sum += Math.abs(v).toDouble()
+                n++
+                i += 2
+            }
+            j += 2
+        }
+        if (n == 0L) return 10f
+        return (Math.sqrt(Math.PI / 2.0) * sum / (6.0 * n.toDouble())).toFloat()
+    }
+
+    private fun bandWork(
+        w: Int, h: Int, rr: FloatArray, gg: FloatArray, bb: FloatArray, out: IntArray,
+        y0: Int, y1: Int, sr: Int, pr: Int, s: Float, hk: Float
+    ) {
+        val ya = Math.max(0, y0 - pr)
+        val yb = Math.min(h, y1 + pr)
+        val rows = yb - ya
+        val brow = y1 - y0
+        val d2 = FloatArray(rows * w)
+        val tmp = FloatArray(rows * w)
+        val aR = FloatArray(brow * w)
+        val aG = FloatArray(brow * w)
+        val aB = FloatArray(brow * w)
+        val aW = FloatArray(brow * w)
+        for (y in y0 until y1) {
+            for (x in 0 until w) {
+                val i = y * w + x
+                val o = (y - y0) * w + x
+                aR[o] = rr[i]
+                aG[o] = gg[i]
+                aB[o] = bb[i]
+                aW[o] = 1f
+            }
+        }
+        val pw = 2 * pr + 1
+        val norm = 1f / (3f * pw * pw)
+        val hh = hk * s
+        val base = 2f * s * s
+        val dmax = base + 9f * hh * hh
+        val ln = 2048
+        val lut = FloatArray(ln)
+        val inv = ln / dmax
+        for (i in 0 until ln) {
+            val d = (i + 0.5f) / inv
+            lut[i] = Math.exp((-Math.max(d - base, 0f) / (hh * hh)).toDouble()).toFloat()
+        }
+        for (dy in -sr..sr) {
+            for (dx in -sr..sr) {
+                if (dx == 0 && dy == 0) continue
+                // квадраты разности цветов между точкой и её соседкой со сдвигом (dx, dy)
+                for (y in ya until yb) {
+                    val yy = y + dy
+                    val ro = (y - ya) * w
+                    if (yy < 0 || yy >= h) {
+                        for (x in 0 until w) d2[ro + x] = 0f
+                        continue
+                    }
+                    val ri = y * w
+                    val rj = yy * w
+                    for (x in 0 until w) {
+                        val xx = x + dx
+                        if (xx < 0 || xx >= w) {
+                            d2[ro + x] = 0f
+                        } else {
+                            val a = rr[ri + x] - rr[rj + xx]
+                            val b = gg[ri + x] - gg[rj + xx]
+                            val c = bb[ri + x] - bb[rj + xx]
+                            d2[ro + x] = a * a + b * b + c * c
+                        }
+                    }
+                }
+                // сумма по окну по горизонтали
+                for (r in 0 until rows) {
+                    val ro = r * w
+                    var acc = 0f
+                    var x = 0
+                    while (x <= pr && x < w) {
+                        acc += d2[ro + x]
+                        x++
+                    }
+                    tmp[ro] = acc
+                    for (xi in 1 until w) {
+                        val add = xi + pr
+                        val sub = xi - pr - 1
+                        if (add < w) acc += d2[ro + add]
+                        if (sub >= 0) acc -= d2[ro + sub]
+                        tmp[ro + xi] = acc
+                    }
+                }
+                // сумма по вертикали и накопление взвешенного среднего
+                for (y in y0 until y1) {
+                    val yy = y + dy
+                    if (yy < 0 || yy >= h) continue
+                    val r0 = Math.max(0, y - pr - ya)
+                    val r1 = Math.min(rows - 1, y + pr - ya)
+                    for (x in 0 until w) {
+                        val xx = x + dx
+                        if (xx < 0 || xx >= w) continue
+                        var sum = 0f
+                        for (r in r0..r1) sum += tmp[r * w + x]
+                        val d = sum * norm
+                        var idx = (d * inv).toInt()
+                        if (idx < 0) idx = 0
+                        if (idx >= ln) continue
+                        val wt = lut[idx]
+                        val o = (y - y0) * w + x
+                        val j = yy * w + xx
+                        aW[o] += wt
+                        aR[o] += wt * rr[j]
+                        aG[o] += wt * gg[j]
+                        aB[o] += wt * bb[j]
+                    }
+                }
+            }
+        }
+        for (y in y0 until y1) {
+            for (x in 0 until w) {
+                val o = (y - y0) * w + x
+                val iw = 1f / aW[o]
+                val r = Math.min(255, Math.max(0, Math.round(aR[o] * iw)))
+                val g = Math.min(255, Math.max(0, Math.round(aG[o] * iw)))
+                val b = Math.min(255, Math.max(0, Math.round(aB[o] * iw)))
+                out[y * w + x] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+            }
+        }
+    }
+
+    private fun runNlm(px: IntArray, w: Int, h: Int, progress: (Int) -> Unit): IntArray {
+        val n = w * h
+        val rr = FloatArray(n)
+        val gg = FloatArray(n)
+        val bb = FloatArray(n)
+        val yy = FloatArray(n)
+        for (i in 0 until n) {
+            val p = px[i]
+            rr[i] = ((p shr 16) and 255).toFloat()
+            gg[i] = ((p shr 8) and 255).toFloat()
+            bb[i] = (p and 255).toFloat()
+            yy[i] = 0.299f * rr[i] + 0.587f * gg[i] + 0.114f * bb[i]
+        }
+        // зерно у нас крупное (камера растягивает снимок), поэтому оценку шума усиливаем
+        var s = estimateSigma(yy, w, h) * 3f
+        if (s < 8f) s = 8f
+        if (s > 40f) s = 40f
+        val out = IntArray(n)
+        val band = 64
+        val nb = (h + band - 1) / band
+        val next = java.util.concurrent.atomic.AtomicInteger(0)
+        val doneB = java.util.concurrent.atomic.AtomicInteger(0)
+        val err = arrayOfNulls<Throwable>(1)
+        val nth = Math.max(1, Math.min(4, Runtime.getRuntime().availableProcessors()))
+        val fs = s
+        val threads = Array(nth) {
+            Thread {
+                try {
+                    while (true) {
+                        val k = next.getAndIncrement()
+                        if (k >= nb) break
+                        val y0 = k * band
+                        val y1 = Math.min(h, y0 + band)
+                        bandWork(w, h, rr, gg, bb, out, y0, y1, 5, 3, fs, 2.2f)
+                        val d = doneB.incrementAndGet()
+                        if (d % 3 == 0 || d == nb) progress(d * 90 / nb)
+                    }
+                } catch (t: Throwable) {
+                    err[0] = t
+                }
+            }
+        }
+        for (t in threads) t.start()
+        for (t in threads) t.join()
+        val e = err[0]
+        if (e != null) throw e
+        return out
+    }
+
+    private fun boxBlur(a: FloatArray, w: Int, h: Int, r: Int) {
+        val t = FloatArray(w * h)
+        for (y in 0 until h) {
+            val ro = y * w
+            var acc = 0f
+            var cnt = 0
+            var x = 0
+            while (x <= r && x < w) {
+                acc += a[ro + x]
+                cnt++
+                x++
+            }
+            t[ro] = acc / cnt
+            for (xi in 1 until w) {
+                if (xi + r < w) {
+                    acc += a[ro + xi + r]
+                    cnt++
+                }
+                if (xi - r - 1 >= 0) {
+                    acc -= a[ro + xi - r - 1]
+                    cnt--
+                }
+                t[ro + xi] = acc / cnt
+            }
+        }
+        for (x in 0 until w) {
+            var acc = 0f
+            var cnt = 0
+            var y = 0
+            while (y <= r && y < h) {
+                acc += t[y * w + x]
+                cnt++
+                y++
+            }
+            a[x] = acc / cnt
+            for (yi in 1 until h) {
+                if (yi + r < h) {
+                    acc += t[(yi + r) * w + x]
+                    cnt++
+                }
+                if (yi - r - 1 >= 0) {
+                    acc -= t[(yi - r - 1) * w + x]
+                    cnt--
+                }
+                a[yi * w + x] = acc / cnt
+            }
+        }
+    }
+
+    // цветной шум размываем сильно (глаз его не замечает), яркость слегка подчёркиваем
+    private fun finish(px: IntArray, w: Int, h: Int) {
+        val n = w * h
+        val yv = FloatArray(n)
+        val cb = FloatArray(n)
+        val cr = FloatArray(n)
+        for (i in 0 until n) {
+            val p = px[i]
+            val r = ((p shr 16) and 255).toFloat()
+            val g = ((p shr 8) and 255).toFloat()
+            val b = (p and 255).toFloat()
+            val y = 0.299f * r + 0.587f * g + 0.114f * b
+            yv[i] = y
+            cb[i] = b - y
+            cr[i] = r - y
+        }
+        boxBlur(cb, w, h, 6)
+        boxBlur(cr, w, h, 6)
+        boxBlur(cb, w, h, 6)
+        boxBlur(cr, w, h, 6)
+        val yb = yv.copyOf()
+        boxBlur(yb, w, h, 2)
+        for (i in 0 until n) {
+            var y = yv[i] + 0.6f * (yv[i] - yb[i])
+            if (y < 0f) y = 0f else if (y > 255f) y = 255f
+            val r = y + cr[i]
+            val b = y + cb[i]
+            val g = (y - 0.299f * r - 0.114f * b) / 0.587f
+            val ri = Math.min(255, Math.max(0, Math.round(r)))
+            val gi = Math.min(255, Math.max(0, Math.round(g)))
+            val bi = Math.min(255, Math.max(0, Math.round(b)))
+            px[i] = (0xFF shl 24) or (ri shl 16) or (gi shl 8) or bi
+        }
+    }
+
+    fun run(src: Bitmap, progress: (Int) -> Unit): Bitmap {
+        val w = src.width
+        val h = src.height
+        val px = IntArray(w * h)
+        src.getPixels(px, 0, w, 0, 0, w, h)
+        val out = runNlm(px, w, h, progress)
+        finish(out, w, h)
+        progress(100)
+        val res = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        res.setPixels(out, 0, w, 0, 0, w, h)
+        return res
     }
 }
