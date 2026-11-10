@@ -201,6 +201,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var stabBtn: TextView
     private var aiOn = true
     private var aiBusy = false
+    private var lastVideoInfo = ""
     private var highZoom = false
     private var mode = 0   // 0 = обычный, 1 = ночной, 2 = дневной (тёплый)
 
@@ -1728,7 +1729,7 @@ class MainActivity : AppCompatActivity() {
                         infoText.text = "ИИ " + pr + "%"
                     }
                 }
-                var side = 640
+                var side = 900
                 val first = loadForEnhance(uri, side)
                 if (first == null) {
                     msg = "Не удалось открыть это фото"
@@ -1740,7 +1741,7 @@ class MainActivity : AppCompatActivity() {
                     while (true) {
                         tries++
                         try {
-                            big = superRes(src, if (tries < 3) 18000L else 0L, cb)
+                            big = superRes(src, if (tries < 3) 30000L else 0L, cb)
                             break
                         } catch (e: TooSlow) {
                             side = (side * e.factor * 0.95f).toInt().coerceAtLeast(160)
@@ -1796,7 +1797,7 @@ class MainActivity : AppCompatActivity() {
                 }
                 prev = videoThumb(out)
                 val sec = (SystemClock.elapsedRealtime() - t0) / 1000
-                msg = "Видео готово за " + sec + " с, сохранено в галерею"
+                msg = "Видео готово за " + sec + " с: " + lastVideoInfo
             } catch (e: Throwable) {
                 msg = "Видео не получилось: " + e.message
             }
@@ -1872,11 +1873,11 @@ class MainActivity : AppCompatActivity() {
                 if (len > 0L) srcBr = len * 8_000_000L / durUs
             }
             // увеличиваем маленькое видео до ~1080p (максимум x2), большое оставляем как есть
-            val s0 = (1920f / maxOf(dw, dh)).coerceIn(1f, 2f)
+            val s0 = (2880f / maxOf(dw, dh)).coerceIn(1.5f, 2f)
             var outW = dw
             var outH = dh
             var inSurf: Surface? = null
-            for (s in listOf(s0, 1f)) {
+            for (s in listOf(s0, 1.25f, 1f)) {
                 outW = align16(dw * s)
                 outH = align16(dh * s)
                 val br = maxOf((outW.toLong() * outH * fps * 0.28).toLong(), (srcBr * 1.25).toLong()).coerceIn(6_000_000L, 60_000_000L).toInt()
@@ -1903,6 +1904,7 @@ class MainActivity : AppCompatActivity() {
             val scale = outW.toFloat() / dw
             val g = VideoGl(inSurf!!, outW, outH, w, h, scale)
             gl = g
+            lastVideoInfo = (if (g.quality) "полный фильтр" else "БЫСТРЫЙ фильтр (полный не запустился)") + ", " + dw + "x" + dh + " -> " + outW + "x" + outH
             val dec = MediaCodec.createDecoderByType(mime)
             decoder = dec
             dec.configure(vf, g.decSurface, null, 0)
@@ -2312,8 +2314,8 @@ private val GL_FS_T = GL_PREC +
     "float b=lum(texture2D(sPrev,vTex+vec2(o.x,0.0)).rgb)+lum(texture2D(sPrev,vTex-vec2(o.x,0.0)).rgb)" +
     "+lum(texture2D(sPrev,vTex+vec2(0.0,o.y)).rgb)+lum(texture2D(sPrev,vTex-vec2(0.0,o.y)).rgb)+lum(p)*2.0;" +
     "float d=abs(a-b)/6.0;" +
-    "float wy=0.8*(1.0-smoothstep(0.02,0.1,d));" +
-    "float wc=0.92*(1.0-smoothstep(0.05,0.2,d));" +
+    "float wy=0.92*(1.0-smoothstep(0.03,0.14,d));" +
+    "float wc=0.97*(1.0-smoothstep(0.06,0.25,d));" +
     "float lc=lum(c);float lp=lum(p);" +
     "float y=mix(lc,lp,wy);" +
     "vec3 ch=mix(c-vec3(lc),p-vec3(lp),wc);" +
@@ -2331,7 +2333,7 @@ private val GL_FS_S3 = GL_PREC +
     "vec3 w=amp*(-1.0/mix(8.0,5.0,uSharp));" +
     "vec3 o=((b+d+f+h)*w+e)/(4.0*w+1.0);" +
     "float l=dot(o,vec3(0.299,0.587,0.114));" +
-    "o=mix(vec3(l),o,1.07);o=(o-0.5)*1.03+0.5;" +
+    "o=mix(vec3(l),o,1.12);o=(o-0.5)*1.06+0.5;" +
     "gl_FragColor=vec4(clamp(o,0.0,1.0),1.0);}"
 
 private class VideoGl(
@@ -2357,6 +2359,7 @@ private class VideoGl(
     private var flip = false
     private var hasPrev = false
     var quality = false
+    var usedScale = 1f
     val st: SurfaceTexture
     val decSurface: Surface
     private val quad: FloatBuffer = ByteBuffer.allocateDirect(16 * 4).order(ByteOrder.nativeOrder()).asFloatBuffer().apply {
@@ -2487,8 +2490,8 @@ private class VideoGl(
         bindQuad(progFast)
         GLES20.glUniformMatrix4fv(loc(progFast, "uTm"), 1, false, tm, 0)
         GLES20.glUniform2f(loc(progFast, "uPx"), 1f / srcW, 1f / srcH)
-        GLES20.glUniform1f(loc(progFast, "uDen"), 250f)
-        GLES20.glUniform1f(loc(progFast, "uSharp"), 0.7f + 0.5f * (scale - 1f))
+        GLES20.glUniform1f(loc(progFast, "uDen"), 70f)
+        GLES20.glUniform1f(loc(progFast, "uSharp"), 1.4f)
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(0x8D65, tex)
         GLES20.glUniform1i(loc(progFast, "sTex"), 0)
@@ -2503,7 +2506,7 @@ private class VideoGl(
         bindQuad(progS1)
         GLES20.glUniformMatrix4fv(loc(progS1, "uTm"), 1, false, tm, 0)
         GLES20.glUniform2f(loc(progS1, "uPx"), 1f / srcW, 1f / srcH)
-        GLES20.glUniform1f(loc(progS1, "uDen"), 140f)
+        GLES20.glUniform1f(loc(progS1, "uDen"), 38f)
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(0x8D65, tex)
         GLES20.glUniform1i(loc(progS1, "sTex"), 0)
@@ -2531,7 +2534,7 @@ private class VideoGl(
         GLES20.glUseProgram(progS3)
         bindQuad(progS3)
         GLES20.glUniform2f(loc(progS3, "uPx"), 1f / outW, 1f / outH)
-        GLES20.glUniform1f(loc(progS3, "uSharp"), (0.7f + 0.2f * (scale - 1f)).coerceAtMost(1f))
+        GLES20.glUniform1f(loc(progS3, "uSharp"), 1f)
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, fboTex[cur])
         GLES20.glUniform1i(loc(progS3, "sTex"), 0)
