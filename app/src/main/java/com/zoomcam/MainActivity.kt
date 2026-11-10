@@ -2706,7 +2706,7 @@ private object NlmDenoise {
             yy[i] = 0.299f * rr[i] + 0.587f * gg[i] + 0.114f * bb[i]
         }
         // зерно у нас крупное (камера растягивает снимок), поэтому оценку шума усиливаем
-        var s = estimateSigma(yy, w, h) * 3f
+        var s = estimateSigma(yy, w, h) * 2.6f
         if (s < 8f) s = 8f
         if (s > 40f) s = 40f
         val out = IntArray(n)
@@ -2725,7 +2725,7 @@ private object NlmDenoise {
                         if (k >= nb) break
                         val y0 = k * band
                         val y1 = Math.min(h, y0 + band)
-                        bandWork(w, h, rr, gg, bb, out, y0, y1, 5, 3, fs, 2.2f)
+                        bandWork(w, h, rr, gg, bb, out, y0, y1, 5, 3, fs, 1.6f)
                         val d = doneB.incrementAndGet()
                         if (d % 3 == 0 || d == nb) progress(d * 90 / nb)
                     }
@@ -2811,9 +2811,10 @@ private object NlmDenoise {
         boxBlur(cb, w, h, 6)
         boxBlur(cr, w, h, 6)
         val yb = yv.copyOf()
-        boxBlur(yb, w, h, 2)
+        boxBlur(yb, w, h, 1)
+        boxBlur(yb, w, h, 1)
         for (i in 0 until n) {
-            var y = yv[i] + 0.6f * (yv[i] - yb[i])
+            var y = yv[i] + 1.6f * (yv[i] - yb[i])
             if (y < 0f) y = 0f else if (y > 255f) y = 255f
             val r = y + cr[i]
             val b = y + cb[i]
