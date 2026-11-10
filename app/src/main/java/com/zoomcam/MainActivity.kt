@@ -1730,7 +1730,7 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
                 var side = 900
-                val first = loadForEnhance(uri, side)
+                val first = loadForEnhance(uri, side, true)
                 if (first == null) {
                     msg = "Не удалось открыть это фото"
                 } else {
@@ -1745,13 +1745,18 @@ class MainActivity : AppCompatActivity() {
                             break
                         } catch (e: TooSlow) {
                             side = (side * e.factor * 0.95f).toInt().coerceAtLeast(160)
-                            src = loadForEnhance(uri, side) ?: break
+                            src = loadForEnhance(uri, side, true) ?: break
                         }
                     }
                     val b = big
                     if (b == null) {
                         msg = "Нет модели esrgan.tflite в приложении"
                     } else {
+                        try {
+                            val up = Bitmap.createScaledBitmap(src, b.width, b.height, true)
+                            android.graphics.Canvas(b).drawBitmap(up, 0f, 0f, android.graphics.Paint().apply { alpha = 80 })
+                            if (up !== src) up.recycle()
+                        } catch (t: Throwable) {}
                         saveJpeg(b, "ZoomCam_AI_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()))
                         val ph = (600f * b.height / b.width).toInt().coerceAtLeast(1)
                         prev = Bitmap.createScaledBitmap(b, 600, ph, true)
@@ -2043,12 +2048,13 @@ class MainActivity : AppCompatActivity() {
     }
 
     // для выбранного из галереи фото: уменьшаем до maxSide по длинной стороне (убирает «квадраты») и поворачиваем как надо
-    private fun loadForEnhance(uri: Uri, maxSide: Int): Bitmap? {
+    private fun loadForEnhance(uri: Uri, maxSide: Int, clean: Boolean = false): Bitmap? {
+        val decSide = if (clean) maxSide * 2 else maxSide
         val bo = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bo) }
         if (bo.outWidth <= 0 || bo.outHeight <= 0) return null
         var sample = 1
-        while (maxOf(bo.outWidth, bo.outHeight) / (sample * 2) >= maxSide) sample *= 2
+        while (maxOf(bo.outWidth, bo.outHeight) / (sample * 2) >= decSide) sample *= 2
         val o = BitmapFactory.Options().apply { inSampleSize = sample }
         var bmp = contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, o) } ?: return null
         val orient = try {
@@ -2067,6 +2073,11 @@ class MainActivity : AppCompatActivity() {
         if (deg != 0f) {
             val m = Matrix().apply { postRotate(deg) }
             bmp = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, m, true)
+        }
+        if (clean) {
+            // ИИ принимает шум за детали и рисует из него «червяков», поэтому сначала сильно чистим шум
+            if (!bmp.isMutable) bmp = bmp.copy(Bitmap.Config.ARGB_8888, true) ?: return null
+            cleanNoise(bmp, true)
         }
         val ms = maxOf(bmp.width, bmp.height)
         if (ms > maxSide) {
