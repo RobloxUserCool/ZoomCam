@@ -84,6 +84,7 @@ import androidx.camera.core.CameraSelector
 import androidx.camera.core.FocusMeteringAction
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
+import androidx.camera.core.ImageProxy
 import androidx.camera.core.resolutionselector.AspectRatioStrategy
 import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.core.resolutionselector.ResolutionStrategy
@@ -587,6 +588,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun takePhoto() {
+        if (aiOn && !isRecording) {
+            takeBurst()
+            return
+        }
         val ic = imageCapture ?: return
         val shotZoom = curZ
         val shotMode = mode
@@ -630,6 +635,166 @@ class MainActivity : AppCompatActivity() {
                 Toast.makeText(this@MainActivity, "Ошибка фото: " + e.message, Toast.LENGTH_LONG).show()
             }
         })
+    }
+
+    // ---- Съёмка серии кадров (когда включена кнопка ИИ) ----
+    private var burstBusy = false
+
+    private fun takeBurst() {
+        if (imageCapture == null) return
+        if (burstBusy || aiBusy) {
+            Toast.makeText(this, "Подожди, предыдущая серия ещё обрабатывается", Toast.LENGTH_SHORT).show()
+            return
+        }
+        burstBusy = true
+        val hwNow = curZ.coerceIn(minZ, maxOf(minZ, hwMaxZ))
+        val extraZ = if (hwNow > 0f) curZ / hwNow else 1f
+        val name = "ZoomCam_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        val st = BurstState(8, extraZ, name)
+        photoBtn.alpha = 0.4f
+        Toast.makeText(this, "Серия из 8 кадров, держи телефон неподвижно", Toast.LENGTH_LONG).show()
+        burstNext(st)
+    }
+
+    private fun burstNext(st: BurstState) {
+        val ic = imageCapture
+        if (ic == null || st.attempts >= st.total + 4) {
+            burstFinish(st)
+            return
+        }
+        st.attempts++
+        infoText.text = "Кадр " + (st.jpegs.size + 1) + "/" + st.total
+        previewView.animate().alpha(0.3f).setDuration(50).withEndAction {
+            previewView.animate().alpha(1f).setDuration(80).start()
+        }.start()
+        ic.takePicture(ContextCompat.getMainExecutor(this), object : ImageCapture.OnImageCapturedCallback() {
+            override fun onCaptureSuccess(image: ImageProxy) {
+                try {
+                    val buf = image.planes[0].buffer
+                    buf.rewind()
+                    val b = ByteArray(buf.remaining())
+                    buf.get(b)
+                    st.jpegs.add(b)
+                    st.rot = image.imageInfo.rotationDegrees
+                } catch (t: Throwable) {
+                } finally {
+                    image.close()
+                }
+                if (st.jpegs.size < st.total) burstNext(st) else burstFinish(st)
+            }
+
+            override fun onError(e: ImageCaptureException) {
+                burstFinish(st)
+            }
+        })
+    }
+
+    private fun burstFinish(st: BurstState) {
+        if (st.jpegs.isEmpty()) {
+            burstBusy = false
+            photoBtn.alpha = 1f
+            infoText.text = "зум до " + fmt(maxZ) + "x"
+            Toast.makeText(this, "Не получилось снять серию", Toast.LENGTH_LONG).show()
+            return
+        }
+        aiBusy = true
+        infoText.text = "Склеиваю кадры…"
+        Thread {
+            var msg: String
+            val t0 = SystemClock.elapsedRealtime()
+            try {
+                val stacked = burstBuild(st) { i, n ->
+                    runOnUiThread { infoText.text = "Склеиваю " + i + "/" + n }
+                }
+                if (stacked == null) {
+                    msg = "Не удалось обработать серию"
+                } else {
+                    val cb: (Int) -> Unit = { pr -> runOnUiThread { infoText.text = "Чищу " + pr + "%" } }
+                    val res = if (st.used >= 2) NlmDenoise.run(stacked, cb, 8f, 1.3f, 0.8f) else NlmDenoise.run(stacked, cb)
+                    saveJpeg(res, st.name)
+                    val sec = (SystemClock.elapsedRealtime() - t0) / 1000
+                    msg = "Готово за " + sec + " с: серия из " + st.used + " кадров, фото в галерее"
+                }
+            } catch (e: Throwable) {
+                msg = "Не получилось: " + e.message
+            }
+            runOnUiThread {
+                aiBusy = false
+                burstBusy = false
+                photoBtn.alpha = 1f
+                infoText.text = "зум до " + fmt(maxZ) + "x"
+                loadLastThumb()
+                Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+            }
+        }.start()
+    }
+
+    // Собираем серию в одну картинку. Вынесено отдельно, чтобы большие массивы освободились сразу после.
+    private fun burstBuild(st: BurstState, onProg: (Int, Int) -> Unit): Bitmap? {
+        val first = st.jpegs[0]
+        val bo = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(first, 0, first.size, bo)
+        val w0 = bo.outWidth
+        val h0 = bo.outHeight
+        if (w0 <= 0 || h0 <= 0) return null
+        val swap = st.rot == 90 || st.rot == 270
+        val fullW = if (swap) h0 else w0
+        val fullH = if (swap) w0 else h0
+        val k = Math.min(1f, 1600f / Math.max(fullW, fullH))
+        val ow = Math.max(160, (fullW * k).toInt())
+        val oh = Math.max(160, (fullH * k).toInt())
+        val stack = BurstStack(ow, oh)
+        val total = st.jpegs.size
+        for (i in 0 until total) {
+            val bmp = burstDecode(st.jpegs[i], st.extra, st.rot, ow, oh)
+            st.jpegs[i] = ByteArray(0)
+            if (bmp != null) {
+                val px = IntArray(ow * oh)
+                bmp.getPixels(px, 0, ow, 0, 0, ow, oh)
+                bmp.recycle()
+                stack.add(px)
+            }
+            onProg(i + 1, total)
+        }
+        st.used = stack.frames
+        if (stack.frames == 0) return null
+        val out = Bitmap.createBitmap(ow, oh, Bitmap.Config.ARGB_8888)
+        out.setPixels(stack.result(), 0, ow, 0, 0, ow, oh)
+        return out
+    }
+
+    // Кадр -> нужный размер: берём центр (если зум выше аппаратного), поворачиваем и растягиваем
+    private fun burstDecode(bytes: ByteArray, extra: Float, deg: Int, ow: Int, oh: Int): Bitmap? {
+        if (bytes.isEmpty()) return null
+        val bo = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bo)
+        val w0 = bo.outWidth
+        val h0 = bo.outHeight
+        if (w0 <= 0 || h0 <= 0) return null
+        var bmp: Bitmap
+        if (extra > 1.02f) {
+            val cw = (w0 / extra).toInt().coerceIn(16, w0)
+            val ch = (h0 / extra).toInt().coerceIn(16, h0)
+            val left = (w0 - cw) / 2
+            val top = (h0 - ch) / 2
+            @Suppress("DEPRECATION")
+            val dec = BitmapRegionDecoder.newInstance(bytes, 0, bytes.size, false) ?: return null
+            val part = dec.decodeRegion(Rect(left, top, left + cw, top + ch), null)
+            dec.recycle()
+            if (part == null) return null
+            bmp = part
+        } else {
+            bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return null
+        }
+        if (deg != 0) {
+            val m = Matrix().apply { postRotate(deg.toFloat()) }
+            val rot = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, m, true)
+            if (rot !== bmp) bmp.recycle()
+            bmp = rot
+        }
+        val big = Bitmap.createScaledBitmap(bmp, ow, oh, true)
+        if (big !== bmp) bmp.recycle()
+        return big
     }
 
     // Обработка фото после съёмки: чистим цветной шум, а при зуме выше аппаратного берём центр кадра и растягиваем
@@ -2692,7 +2857,7 @@ private object NlmDenoise {
         }
     }
 
-    private fun runNlm(px: IntArray, w: Int, h: Int, progress: (Int) -> Unit): IntArray {
+    private fun runNlm(px: IntArray, w: Int, h: Int, fixedSigma: Float, hk: Float, progress: (Int) -> Unit): IntArray {
         val n = w * h
         val rr = FloatArray(n)
         val gg = FloatArray(n)
@@ -2706,9 +2871,12 @@ private object NlmDenoise {
             yy[i] = 0.299f * rr[i] + 0.587f * gg[i] + 0.114f * bb[i]
         }
         // зерно у нас крупное (камера растягивает снимок), поэтому оценку шума усиливаем
-        var s = estimateSigma(yy, w, h) * 2.6f
-        if (s < 8f) s = 8f
-        if (s > 40f) s = 40f
+        var s = fixedSigma
+        if (s <= 0f) {
+            s = estimateSigma(yy, w, h) * 2.6f
+            if (s < 8f) s = 8f
+            if (s > 40f) s = 40f
+        }
         val out = IntArray(n)
         val band = 64
         val nb = (h + band - 1) / band
@@ -2725,7 +2893,7 @@ private object NlmDenoise {
                         if (k >= nb) break
                         val y0 = k * band
                         val y1 = Math.min(h, y0 + band)
-                        bandWork(w, h, rr, gg, bb, out, y0, y1, 5, 3, fs, 1.6f)
+                        bandWork(w, h, rr, gg, bb, out, y0, y1, 5, 3, fs, hk)
                         val d = doneB.incrementAndGet()
                         if (d % 3 == 0 || d == nb) progress(d * 90 / nb)
                     }
@@ -2741,7 +2909,7 @@ private object NlmDenoise {
         return out
     }
 
-    private fun boxBlur(a: FloatArray, w: Int, h: Int, r: Int) {
+    fun boxBlur(a: FloatArray, w: Int, h: Int, r: Int) {
         val t = FloatArray(w * h)
         for (y in 0 until h) {
             val ro = y * w
@@ -2791,7 +2959,7 @@ private object NlmDenoise {
     }
 
     // цветной шум размываем сильно (глаз его не замечает), яркость слегка подчёркиваем
-    private fun finish(px: IntArray, w: Int, h: Int) {
+    private fun finish(px: IntArray, w: Int, h: Int, sharp: Float) {
         val n = w * h
         val yv = FloatArray(n)
         val cb = FloatArray(n)
@@ -2814,7 +2982,7 @@ private object NlmDenoise {
         boxBlur(yb, w, h, 1)
         boxBlur(yb, w, h, 1)
         for (i in 0 until n) {
-            var y = yv[i] + 1.6f * (yv[i] - yb[i])
+            var y = yv[i] + sharp * (yv[i] - yb[i])
             if (y < 0f) y = 0f else if (y > 255f) y = 255f
             val r = y + cr[i]
             val b = y + cb[i]
@@ -2826,16 +2994,225 @@ private object NlmDenoise {
         }
     }
 
-    fun run(src: Bitmap, progress: (Int) -> Unit): Bitmap {
+    fun run(src: Bitmap, progress: (Int) -> Unit, fixedSigma: Float = 0f, hk: Float = 1.6f, sharp: Float = 1.6f): Bitmap {
         val w = src.width
         val h = src.height
         val px = IntArray(w * h)
         src.getPixels(px, 0, w, 0, 0, w, h)
-        val out = runNlm(px, w, h, progress)
-        finish(out, w, h)
+        val out = runNlm(px, w, h, fixedSigma, hk, progress)
+        finish(out, w, h, sharp)
         progress(100)
         val res = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
         res.setPixels(out, 0, w, 0, 0, w, h)
         return res
+    }
+}
+
+// Состояние съёмки серии кадров
+private class BurstState(val total: Int, val extra: Float, val name: String) {
+    val jpegs = ArrayList<ByteArray>()
+    var rot = 0
+    var attempts = 0
+    var used = 0
+}
+
+// Серия кадров: совмещаем каждый кадр с первым (сдвиг ищем с точностью до долей пикселя) и усредняем.
+// Шум падает, а детали остаются, потому что они одинаковые во всех кадрах.
+// Движущиеся предметы (там, где кадры расходятся) берутся только из первого кадра, чтобы не было шлейфов.
+private class BurstStack(val w: Int, val h: Int) {
+    private val n = w * h
+    private val w1 = w / 2
+    private val h1 = h / 2
+    private val w2 = w1 / 2
+    private val h2 = h1 / 2
+    private var g0 = FloatArray(0)
+    private var g1 = FloatArray(0)
+    private var g2 = FloatArray(0)
+    private var refB = FloatArray(0)
+    private val aR = FloatArray(n)
+    private val aG = FloatArray(n)
+    private val aB = FloatArray(n)
+    private val aW = FloatArray(n)
+    var frames = 0
+
+    private fun lumaOf(px: IntArray): FloatArray {
+        val g = FloatArray(px.size)
+        for (i in px.indices) {
+            val p = px[i]
+            g[i] = 0.299f * ((p shr 16) and 255) + 0.587f * ((p shr 8) and 255) + 0.114f * (p and 255)
+        }
+        return g
+    }
+
+    private fun down2(g: FloatArray, sw: Int, sh: Int): FloatArray {
+        val nw = sw / 2
+        val nh = sh / 2
+        val o = FloatArray(nw * nh)
+        for (y in 0 until nh) {
+            for (x in 0 until nw) {
+                val i = (2 * y) * sw + 2 * x
+                o[y * nw + x] = (g[i] + g[i + 1] + g[i + sw] + g[i + sw + 1]) * 0.25f
+            }
+        }
+        return o
+    }
+
+    private fun ssd(a: FloatArray, b: FloatArray, sw: Int, sh: Int, dx: Int, dy: Int, m: Int, step: Int): Double {
+        var s = 0.0
+        var y = m
+        while (y < sh - m) {
+            val ra = y * sw
+            val rb = (y + dy) * sw
+            var x = m
+            while (x < sw - m) {
+                val d = a[ra + x] - b[rb + x + dx]
+                s += (d * d).toDouble()
+                x += step
+            }
+            y += step
+        }
+        return s
+    }
+
+    private fun search(a: FloatArray, b: FloatArray, sw: Int, sh: Int, cx: Int, cy: Int, r: Int, m: Int, step: Int): IntArray {
+        var best = Double.MAX_VALUE
+        var bx = cx
+        var by = cy
+        for (dy in cy - r..cy + r) {
+            for (dx in cx - r..cx + r) {
+                val s = ssd(a, b, sw, sh, dx, dy, m, step)
+                if (s < best) {
+                    best = s
+                    bx = dx
+                    by = dy
+                }
+            }
+        }
+        return intArrayOf(bx, by)
+    }
+
+    private fun sub(sm: Double, s0: Double, sp: Double): Float {
+        val den = sm - 2.0 * s0 + sp
+        if (den <= 1e-9) return 0f
+        val v = 0.5 * (sm - sp) / den
+        return Math.max(-0.5, Math.min(0.5, v)).toFloat()
+    }
+
+    // сдвиг кадра относительно первого: cur(x + sx, y + sy) совпадает с ref(x, y); null если не нашли
+    private fun align(c0: FloatArray): FloatArray? {
+        val c1 = down2(c0, w, h)
+        val c2 = down2(c1, w1, h1)
+        val s2 = search(g2, c2, w2, h2, 0, 0, 8, 10, 1)
+        if (Math.abs(s2[0]) >= 8 || Math.abs(s2[1]) >= 8) return null
+        val s1 = search(g1, c1, w1, h1, s2[0] * 2, s2[1] * 2, 2, 24, 2)
+        val s0 = search(g0, c0, w, h, s1[0] * 2, s1[1] * 2, 2, 52, 2)
+        val m = 52
+        val sm = ssd(g0, c0, w, h, s0[0] - 1, s0[1], m, 2)
+        val sc = ssd(g0, c0, w, h, s0[0], s0[1], m, 2)
+        val sp = ssd(g0, c0, w, h, s0[0] + 1, s0[1], m, 2)
+        val tm = ssd(g0, c0, w, h, s0[0], s0[1] - 1, m, 2)
+        val tp = ssd(g0, c0, w, h, s0[0], s0[1] + 1, m, 2)
+        return floatArrayOf(s0[0] + sub(sm, sc, sp), s0[1] + sub(tm, sc, tp))
+    }
+
+    fun add(px: IntArray): Boolean {
+        if (frames == 0) {
+            g0 = lumaOf(px)
+            g1 = down2(g0, w, h)
+            g2 = down2(g1, w1, h1)
+            refB = g0.copyOf()
+            NlmDenoise.boxBlur(refB, w, h, 2)
+            for (i in 0 until n) {
+                val p = px[i]
+                aR[i] = ((p shr 16) and 255).toFloat()
+                aG[i] = ((p shr 8) and 255).toFloat()
+                aB[i] = (p and 255).toFloat()
+                aW[i] = 1f
+            }
+            frames = 1
+            return true
+        }
+        val c0 = lumaOf(px)
+        val sh = align(c0) ?: return false
+        val sx = sh[0]
+        val sy = sh[1]
+        // выровненная яркость нужна, чтобы найти движущиеся предметы
+        val ay = FloatArray(n)
+        for (y in 0 until h) {
+            for (x in 0 until w) {
+                val fx = Math.min(w - 1.001f, Math.max(0f, x + sx))
+                val fy = Math.min(h - 1.001f, Math.max(0f, y + sy))
+                val ix = fx.toInt()
+                val iy = fy.toInt()
+                val tx = fx - ix
+                val ty = fy - iy
+                val i = iy * w + ix
+                ay[y * w + x] = (c0[i] * (1 - tx) + c0[i + 1] * tx) * (1 - ty) + (c0[i + w] * (1 - tx) + c0[i + w + 1] * tx) * ty
+            }
+        }
+        NlmDenoise.boxBlur(ay, w, h, 2)
+        val hist = IntArray(256)
+        var cnt = 0L
+        var k = 0
+        while (k < n) {
+            val d = Math.min(255, Math.abs(ay[k] - refB[k]).toInt())
+            hist[d]++
+            cnt++
+            k += 7
+        }
+        var acc = 0L
+        var med = 0
+        for (d in 0 until 256) {
+            acc += hist[d]
+            if (acc * 2 >= cnt) {
+                med = d
+                break
+            }
+        }
+        val tt = Math.max(6f, 2.5f * med + 3f)
+        for (y in 0 until h) {
+            for (x in 0 until w) {
+                val o = y * w + x
+                val d = Math.abs(ay[o] - refB[o]) / tt
+                val wt = Math.exp((-d * d).toDouble()).toFloat()
+                if (wt < 0.02f) continue
+                val fx = Math.min(w - 1.001f, Math.max(0f, x + sx))
+                val fy = Math.min(h - 1.001f, Math.max(0f, y + sy))
+                val ix = fx.toInt()
+                val iy = fy.toInt()
+                val tx = fx - ix
+                val ty = fy - iy
+                val i = iy * w + ix
+                val p00 = px[i]
+                val p01 = px[i + 1]
+                val p10 = px[i + w]
+                val p11 = px[i + w + 1]
+                val w00 = (1 - tx) * (1 - ty)
+                val w01 = tx * (1 - ty)
+                val w10 = (1 - tx) * ty
+                val w11 = tx * ty
+                val r = ((p00 shr 16) and 255) * w00 + ((p01 shr 16) and 255) * w01 + ((p10 shr 16) and 255) * w10 + ((p11 shr 16) and 255) * w11
+                val g = ((p00 shr 8) and 255) * w00 + ((p01 shr 8) and 255) * w01 + ((p10 shr 8) and 255) * w10 + ((p11 shr 8) and 255) * w11
+                val b = (p00 and 255) * w00 + (p01 and 255) * w01 + (p10 and 255) * w10 + (p11 and 255) * w11
+                aR[o] += wt * r
+                aG[o] += wt * g
+                aB[o] += wt * b
+                aW[o] += wt
+            }
+        }
+        frames++
+        return true
+    }
+
+    fun result(): IntArray {
+        val o = IntArray(n)
+        for (i in 0 until n) {
+            val iw = 1f / aW[i]
+            val r = Math.min(255, Math.max(0, Math.round(aR[i] * iw)))
+            val g = Math.min(255, Math.max(0, Math.round(aG[i] * iw)))
+            val b = Math.min(255, Math.max(0, Math.round(aB[i] * iw)))
+            o[i] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+        }
+        return o
     }
 }
