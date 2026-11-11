@@ -710,7 +710,13 @@ class MainActivity : AppCompatActivity() {
                     msg = "Не удалось обработать серию"
                 } else {
                     val cb: (Int) -> Unit = { pr -> runOnUiThread { infoText.text = "Чищу " + pr + "%" } }
-                    val res = if (st.used >= 2) NlmDenoise.run(stacked, cb, 8f, 1.3f, 0.8f) else NlmDenoise.run(stacked, cb)
+                    val clean = if (st.used >= 2) {
+                        NlmDenoise.run(stacked, cb, 0f, 1.2f, 0f, 2, 1.5f, 3f, 2)
+                    } else {
+                        NlmDenoise.run(stacked, cb, 0f, 1.6f, 0f, 2, 2.2f, 8f, 3)
+                    }
+                    val big = if (clean.width != st.outW || clean.height != st.outH) NlmDenoise.upscale(clean, st.outW, st.outH) else clean
+                    val res = NlmDenoise.sharpen(big, 0.8f, if (st.extra > 1.5f) 2 else 1)
                     saveJpeg(res, st.name)
                     val sec = (SystemClock.elapsedRealtime() - t0) / 1000
                     msg = "Готово за " + sec + " с: серия из " + st.used + " кадров, фото в галерее"
@@ -741,8 +747,14 @@ class MainActivity : AppCompatActivity() {
         val fullW = if (swap) h0 else w0
         val fullH = if (swap) w0 else h0
         val k = Math.min(1f, 1600f / Math.max(fullW, fullH))
-        val ow = Math.max(160, (fullW * k).toInt())
-        val oh = Math.max(160, (fullH * k).toInt())
+        val outW = Math.max(160, (fullW * k).toInt())
+        val outH = Math.max(160, (fullH * k).toInt())
+        // склеиваем и чистим шум на родном разрешении (до растягивания), иначе шум растягивается в пятна
+        val ex = if (st.extra > 1.02f) st.extra else 1f
+        val ow = Math.max(160, Math.min(outW, (outW / ex).toInt()))
+        val oh = Math.max(160, Math.min(outH, (outH / ex).toInt()))
+        st.outW = outW
+        st.outH = outH
         val stack = BurstStack(ow, oh)
         val total = st.jpegs.size
         for (i in 0 until total) {
@@ -2857,7 +2869,7 @@ private object NlmDenoise {
         }
     }
 
-    private fun runNlm(px: IntArray, w: Int, h: Int, fixedSigma: Float, hk: Float, progress: (Int) -> Unit): IntArray {
+    private fun runNlm(px: IntArray, w: Int, h: Int, fixedSigma: Float, hk: Float, pr: Int, sigmaMul: Float, sMin: Float, progress: (Int) -> Unit): IntArray {
         val n = w * h
         val rr = FloatArray(n)
         val gg = FloatArray(n)
@@ -2873,8 +2885,8 @@ private object NlmDenoise {
         // зерно у нас крупное (камера растягивает снимок), поэтому оценку шума усиливаем
         var s = fixedSigma
         if (s <= 0f) {
-            s = estimateSigma(yy, w, h) * 2.6f
-            if (s < 8f) s = 8f
+            s = estimateSigma(yy, w, h) * sigmaMul
+            if (s < sMin) s = sMin
             if (s > 40f) s = 40f
         }
         val out = IntArray(n)
@@ -2893,7 +2905,7 @@ private object NlmDenoise {
                         if (k >= nb) break
                         val y0 = k * band
                         val y1 = Math.min(h, y0 + band)
-                        bandWork(w, h, rr, gg, bb, out, y0, y1, 5, 3, fs, hk)
+                        bandWork(w, h, rr, gg, bb, out, y0, y1, 5, pr, fs, hk)
                         val d = doneB.incrementAndGet()
                         if (d % 3 == 0 || d == nb) progress(d * 90 / nb)
                     }
@@ -2959,7 +2971,7 @@ private object NlmDenoise {
     }
 
     // цветной шум размываем сильно (глаз его не замечает), яркость слегка подчёркиваем
-    private fun finish(px: IntArray, w: Int, h: Int, sharp: Float) {
+    private fun finish(px: IntArray, w: Int, h: Int, sharp: Float, chromaR: Int) {
         val n = w * h
         val yv = FloatArray(n)
         val cb = FloatArray(n)
@@ -2974,10 +2986,10 @@ private object NlmDenoise {
             cb[i] = b - y
             cr[i] = r - y
         }
-        boxBlur(cb, w, h, 6)
-        boxBlur(cr, w, h, 6)
-        boxBlur(cb, w, h, 6)
-        boxBlur(cr, w, h, 6)
+        boxBlur(cb, w, h, chromaR)
+        boxBlur(cr, w, h, chromaR)
+        boxBlur(cb, w, h, chromaR)
+        boxBlur(cr, w, h, chromaR)
         val yb = yv.copyOf()
         boxBlur(yb, w, h, 1)
         boxBlur(yb, w, h, 1)
@@ -2994,13 +3006,122 @@ private object NlmDenoise {
         }
     }
 
-    fun run(src: Bitmap, progress: (Int) -> Unit, fixedSigma: Float = 0f, hk: Float = 1.6f, sharp: Float = 1.6f): Bitmap {
+    // Растягивание картинки (бикубика Кэтмулла-Рома): аккуратнее, чем простое сглаживание Android
+    fun upscale(src: Bitmap, ow: Int, oh: Int): Bitmap {
+        val sw = src.width
+        val sh = src.height
+        val px = IntArray(sw * sh)
+        src.getPixels(px, 0, sw, 0, 0, sw, sh)
+        val xi = IntArray(ow * 4)
+        val xw = FloatArray(ow * 4)
+        for (x in 0 until ow) {
+            val sx = (x + 0.5f) * sw / ow - 0.5f
+            val ix = Math.floor(sx.toDouble()).toInt()
+            val t = sx - ix
+            cubicW(t, xw, x * 4)
+            for (k in 0 until 4) xi[x * 4 + k] = Math.min(sw - 1, Math.max(0, ix - 1 + k))
+        }
+        val yi = IntArray(oh * 4)
+        val yw = FloatArray(oh * 4)
+        for (y in 0 until oh) {
+            val sy = (y + 0.5f) * sh / oh - 0.5f
+            val iy = Math.floor(sy.toDouble()).toInt()
+            val t = sy - iy
+            cubicW(t, yw, y * 4)
+            for (k in 0 until 4) yi[y * 4 + k] = Math.min(sh - 1, Math.max(0, iy - 1 + k))
+        }
+        val tr = FloatArray(ow * sh)
+        val tg = FloatArray(ow * sh)
+        val tb = FloatArray(ow * sh)
+        for (y in 0 until sh) {
+            for (x in 0 until ow) {
+                var r = 0f
+                var g = 0f
+                var b = 0f
+                for (k in 0 until 4) {
+                    val p = px[y * sw + xi[x * 4 + k]]
+                    val wt = xw[x * 4 + k]
+                    r += wt * ((p shr 16) and 255)
+                    g += wt * ((p shr 8) and 255)
+                    b += wt * (p and 255)
+                }
+                val o = y * ow + x
+                tr[o] = r
+                tg[o] = g
+                tb[o] = b
+            }
+        }
+        val out = IntArray(ow * oh)
+        for (y in 0 until oh) {
+            for (x in 0 until ow) {
+                var r = 0f
+                var g = 0f
+                var b = 0f
+                for (k in 0 until 4) {
+                    val o = yi[y * 4 + k] * ow + x
+                    val wt = yw[y * 4 + k]
+                    r += wt * tr[o]
+                    g += wt * tg[o]
+                    b += wt * tb[o]
+                }
+                val ri = Math.min(255, Math.max(0, Math.round(r)))
+                val gi = Math.min(255, Math.max(0, Math.round(g)))
+                val bi = Math.min(255, Math.max(0, Math.round(b)))
+                out[y * ow + x] = (0xFF shl 24) or (ri shl 16) or (gi shl 8) or bi
+            }
+        }
+        val res = Bitmap.createBitmap(ow, oh, Bitmap.Config.ARGB_8888)
+        res.setPixels(out, 0, ow, 0, 0, ow, oh)
+        return res
+    }
+
+    private fun cubicW(t: Float, w: FloatArray, o: Int) {
+        val t2 = t * t
+        val t3 = t2 * t
+        w[o] = -0.5f * t3 + t2 - 0.5f * t
+        w[o + 1] = 1.5f * t3 - 2.5f * t2 + 1f
+        w[o + 2] = -1.5f * t3 + 2f * t2 + 0.5f * t
+        w[o + 3] = 0.5f * t3 - 0.5f * t2
+    }
+
+    // Резкость по яркости (на уже растянутой картинке, чтобы подчёркивались настоящие края)
+    fun sharpen(src: Bitmap, amount: Float, r: Int): Bitmap {
+        val w = src.width
+        val h = src.height
+        val n = w * h
+        val px = IntArray(n)
+        src.getPixels(px, 0, w, 0, 0, w, h)
+        val yv = FloatArray(n)
+        for (i in 0 until n) {
+            val p = px[i]
+            yv[i] = 0.299f * ((p shr 16) and 255) + 0.587f * ((p shr 8) and 255) + 0.114f * (p and 255)
+        }
+        val yb = yv.copyOf()
+        boxBlur(yb, w, h, r)
+        boxBlur(yb, w, h, r)
+        for (i in 0 until n) {
+            val d = amount * (yv[i] - yb[i])
+            val p = px[i]
+            val ri = Math.min(255, Math.max(0, Math.round(((p shr 16) and 255) + d)))
+            val gi = Math.min(255, Math.max(0, Math.round(((p shr 8) and 255) + d)))
+            val bi = Math.min(255, Math.max(0, Math.round((p and 255) + d)))
+            px[i] = (0xFF shl 24) or (ri shl 16) or (gi shl 8) or bi
+        }
+        val res = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        res.setPixels(px, 0, w, 0, 0, w, h)
+        return res
+    }
+
+    fun run(
+        src: Bitmap, progress: (Int) -> Unit, fixedSigma: Float = 0f, hk: Float = 1.6f, sharp: Float = 1.6f,
+        chromaR: Int = 6, sigmaMul: Float = 2.6f, sMin: Float = 8f, pr: Int = 3
+    ): Bitmap {
         val w = src.width
         val h = src.height
         val px = IntArray(w * h)
         src.getPixels(px, 0, w, 0, 0, w, h)
-        val out = runNlm(px, w, h, fixedSigma, hk, progress)
-        finish(out, w, h, sharp)
+        val out = runNlm(px, w, h, fixedSigma, hk, pr, sigmaMul, sMin, progress)
+        finish(out, w, h, sharp, chromaR)
         progress(100)
         val res = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
         res.setPixels(out, 0, w, 0, 0, w, h)
@@ -3014,6 +3135,8 @@ private class BurstState(val total: Int, val extra: Float, val name: String) {
     var rot = 0
     var attempts = 0
     var used = 0
+    var outW = 0
+    var outH = 0
 }
 
 // Серия кадров: совмещаем каждый кадр с первым (сдвиг ищем с точностью до долей пикселя) и усредняем.
