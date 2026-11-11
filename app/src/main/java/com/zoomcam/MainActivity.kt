@@ -651,7 +651,7 @@ class MainActivity : AppCompatActivity() {
         val extraZ = if (hwNow > 0f) curZ / hwNow else 1f
         val name = "ZoomCam_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
         val st = BurstState(8, extraZ, name)
-        photoBtn.alpha = 0.4f
+        findViewById<View>(R.id.photoBtn).alpha = 0.4f
         Toast.makeText(this, "Серия из 8 кадров, держи телефон неподвижно", Toast.LENGTH_LONG).show()
         burstNext(st)
     }
@@ -692,7 +692,7 @@ class MainActivity : AppCompatActivity() {
     private fun burstFinish(st: BurstState) {
         if (st.jpegs.isEmpty()) {
             burstBusy = false
-            photoBtn.alpha = 1f
+            findViewById<View>(R.id.photoBtn).alpha = 1f
             infoText.text = "зум до " + fmt(maxZ) + "x"
             Toast.makeText(this, "Не получилось снять серию", Toast.LENGTH_LONG).show()
             return
@@ -721,7 +721,7 @@ class MainActivity : AppCompatActivity() {
             runOnUiThread {
                 aiBusy = false
                 burstBusy = false
-                photoBtn.alpha = 1f
+                findViewById<View>(R.id.photoBtn).alpha = 1f
                 infoText.text = "зум до " + fmt(maxZ) + "x"
                 loadLastThumb()
                 Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
